@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: dtoe-master
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/dtoe}
+    username: ${SPRING_DATASOURCE_USERNAME:dtoe}
+    password: ${SPRING_DATASOURCE_PASSWORD:dtoe}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+    consumer:
+      group-id: dtoe-master
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        spring.json.trusted.packages: "com.dtoe.*"
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  probes:
+    enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+dtoe:
+  scheduler:
+    interval-ms: ${DTOE_SCHEDULER_INTERVAL_MS:5000}
+    timeout-check-ms: ${DTOE_SCHEDULER_TIMEOUT_CHECK_MS:10000}
+  worker:
+    dead-threshold-seconds: ${DTOE_WORKER_DEAD_THRESHOLD_SECONDS:60}
+  kafka:
+    topics:
+      task-queue: task-queue
+      task-results: task-results
+
+logging:
+  level:
+    com.dtoe: INFO
+    org.springframework.kafka: WARN
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+  jpa:
+    show-sql: true
+logging:
+  level:
+    com.dtoe: DEBUG
