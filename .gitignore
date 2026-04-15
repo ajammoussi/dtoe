@@ -49,3 +49,17 @@ logs/
 
 # Application
 application-local.yml
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work.sum
+vendor/
+bin/
+scheduler/scheduler
+worker/worker
