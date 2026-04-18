@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     queued_at TIMESTAMPTZ,
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
+    scheduled_for TIMESTAMPTZ,
     error_message TEXT,
     output JSONB
 );

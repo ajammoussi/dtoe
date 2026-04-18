@@ -1,92 +1,141 @@
 package main
 
 import (
-    "context"
-    "fmt"
-    "net/http"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    "github.com/dtoe/worker/internal/config"
-    "github.com/dtoe/worker/internal/kafka"
-    gozap "go.uber.org/zap"
+	"github.com/dtoe/worker/internal/config"
+	"github.com/dtoe/worker/internal/kafka"
+	gozap "go.uber.org/zap"
 )
 
 func main() {
-    logger, _ := gozap.NewProduction()
-    sugar := logger.Sugar()
-    defer sugar.Sync()
+	logger, _ := gozap.NewProduction()
+	sugar := logger.Sugar()
+	defer sugar.Sync()
 
-    cfg, err := config.Load()
-    if err != nil {
-        sugar.Fatalf("Failed to load config: %v", err)
-    }
+	cfg, err := config.Load()
+	if err != nil {
+		sugar.Fatalf("Failed to load config: %v", err)
+	}
 
-    consumer, err := kafka.NewConsumer(cfg, sugar)
-    if err != nil {
-        sugar.Fatalf("Failed to create consumer: %v", err)
-    }
-    defer consumer.Close()
+	if err := validateConfig(cfg, sugar); err != nil {
+		sugar.Fatalf("Config validation failed: %v", err)
+	}
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
+	consumer, err := kafka.NewConsumer(cfg, sugar)
+	if err != nil {
+		sugar.Fatalf("Failed to create consumer: %v", err)
+	}
 
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-    go func() {
-        <-sigChan
-        sugar.Info("Received shutdown signal, stopping...")
-        cancel()
-    }()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-    go func() {
-        ticker := time.NewTicker(time.Duration(cfg.Worker.HeartbeatIntervalMs) * time.Millisecond)
-        defer ticker.Stop()
+	go func() {
+		sig := <-sigChan
+		sugar.Infow("Received shutdown signal", "signal", sig)
+		cancel()
+	}()
 
-        for {
-            select {
-            case <-ticker.C:
-                if err := consumer.SendHeartbeat(ctx); err != nil {
-                    sugar.Errorw("Failed to send heartbeat", "error", err)
-                }
-            case <-ctx.Done():
-                return
-            }
-        }
-    }()
+	heartbeatTicker := time.NewTicker(time.Duration(cfg.Worker.HeartbeatIntervalMs) * time.Millisecond)
+	defer heartbeatTicker.Stop()
 
-    sugar.Infow("Worker started",
-        "workerId", consumer.GetWorkerID(),
-        "threadPoolSize", cfg.Worker.ThreadPoolSize,
-    )
+	go func() {
+		for {
+			select {
+			case <-heartbeatTicker.C:
+				if err := consumer.SendHeartbeat(ctx); err != nil {
+					sugar.Errorw("Failed to send heartbeat", "error", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
-    http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        fmt.Fprintf(w, `{"status":"OK","workerId":"%s","activeTasks":%d}`,
-            consumer.GetWorkerID(), consumer.GetActiveTasks())
-    })
+	sugar.Infow("Worker started",
+		"workerId", consumer.GetWorkerID(),
+		"threadPoolSize", cfg.Worker.ThreadPoolSize,
+	)
 
-    httpServer := &http.Server{Addr: ":8082"}
-    go func() {
-        if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            sugar.Errorf("HTTP server error: %v", err)
-        }
-    }()
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"OK","workerId":"%s","activeTasks":%d}`,
+			consumer.GetWorkerID(), consumer.GetActiveTasks())
+	})
 
-    go func() {
-        if err := consumer.Run(ctx); err != nil {
-            sugar.Errorw("Consumer error", "error", err)
-        }
-    }()
+	httpServer := &http.Server{Addr: ":8082"}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			sugar.Errorf("HTTP server error: %v", err)
+		}
+	}()
 
-    <-ctx.Done()
+	consumerCtx, consumerCancel := context.WithCancel(context.Background())
+	go func() {
+		if err := consumer.Run(consumerCtx); err != nil {
+			sugar.Errorw("Consumer error", "error", err)
+		}
+	}()
 
-    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer shutdownCancel()
+	<-ctx.Done()
 
-    httpServer.Shutdown(shutdownCtx)
-    sugar.Info("Worker stopped")
+	sugar.Info("Initiating graceful shutdown...")
+
+	consumerCancel()
+
+	if ok := consumer.WaitForCompletion(ctx, 60*time.Second); !ok {
+		sugar.Warn("Timeout waiting for in-flight tasks to complete")
+	} else {
+		sugar.Info("All in-flight tasks completed")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		sugar.Errorw("HTTP server shutdown error", "error", err)
+	}
+
+	consumer.Close()
+
+	sugar.Info("Worker stopped")
+}
+
+func validateConfig(cfg *config.Config, logger *gozap.SugaredLogger) error {
+	if cfg.Database.Host == "" {
+		return fmt.Errorf("database host is required")
+	}
+	if cfg.Database.Database == "" {
+		return fmt.Errorf("database name is required")
+	}
+	if len(cfg.Kafka.Brokers) == 0 {
+		return fmt.Errorf("kafka brokers are required")
+	}
+	if cfg.Kafka.TaskQueueTopic == "" {
+		return fmt.Errorf("kafka task queue topic is required")
+	}
+	if cfg.Kafka.TaskResultTopic == "" {
+		return fmt.Errorf("kafka task result topic is required")
+	}
+	if cfg.Worker.ThreadPoolSize < 1 {
+		logger.Warn("Thread pool size is too low, setting to minimum 1")
+		cfg.Worker.ThreadPoolSize = 1
+	}
+	if cfg.Worker.ThreadPoolSize > 100 {
+		logger.Warn("Thread pool size is very high, consider reducing")
+	}
+	if cfg.Worker.HeartbeatIntervalMs < 1000 {
+		logger.Warn("Heartbeat interval is very low, setting to minimum 1000ms")
+		cfg.Worker.HeartbeatIntervalMs = 1000
+	}
+	return nil
 }

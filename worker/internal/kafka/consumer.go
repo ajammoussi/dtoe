@@ -55,7 +55,7 @@ func NewConsumer(cfg *config.Config, logger *gozap.SugaredLogger) (*Consumer, er
     }
 
     hb, err := heartbeat.NewService(connString, workerID, func() int {
-        return int(atomic.LoadInt32(&cfg.Worker.ThreadPoolSize))
+        return cfg.Worker.ThreadPoolSize
     }, cfg.Worker.ThreadPoolSize)
     if err != nil {
         return nil, err
@@ -110,55 +110,68 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 func (c *Consumer) processTask(ctx context.Context, msg *messaging.TaskMessage) {
-    defer atomic.AddInt32(&c.activeTasks, -1)
+	defer atomic.AddInt32(&c.activeTasks, -1)
 
-    taskUUID, err := uuid.Parse(msg.TaskID)
-    if err != nil {
-        c.logger.Errorw("Invalid task ID", "taskId", msg.TaskID, "error", err)
-        return
-    }
+	taskUUID, err := uuid.Parse(msg.TaskID)
+	if err != nil {
+		c.logger.Errorw("Invalid task ID", "taskId", msg.TaskID, "error", err)
+		return
+	}
 
-    acquired, err := c.tryAcquireLock(ctx, taskUUID)
-    if err != nil {
-        c.logger.Errorw("Failed to acquire lock", "taskId", msg.TaskID, "error", err)
-        return
-    }
-    if !acquired {
-        c.logger.Debugw("Task already being processed by another worker", "taskId", msg.TaskID)
-        return
-    }
-    defer c.releaseLock(ctx, taskUUID)
+	c.insertTaskLog(ctx, taskUUID, "INFO", "Task received by worker "+c.workerID)
 
-    if err := c.setTaskRunning(ctx, taskUUID); err != nil {
-        c.logger.Errorw("Failed to set task running", "taskId", msg.TaskID, "error", err)
-        return
-    }
+	acquired, err := c.tryAcquireLock(ctx, taskUUID)
+	if err != nil {
+		c.logger.Errorw("Failed to acquire lock", "taskId", msg.TaskID, "error", err)
+		c.insertTaskLog(ctx, taskUUID, "ERROR", "Failed to acquire lock: "+err.Error())
+		return
+	}
+	if !acquired {
+		c.logger.Debugw("Task already being processed by another worker", "taskId", msg.TaskID)
+		return
+	}
+	defer c.releaseLock(ctx, taskUUID)
 
-    result := c.executor.Execute(ctx, msg)
+	if err := c.setTaskRunning(ctx, taskUUID); err != nil {
+		c.logger.Errorw("Failed to set task running", "taskId", msg.TaskID, "error", err)
+		c.insertTaskLog(ctx, taskUUID, "ERROR", "Failed to set task running: "+err.Error())
+		return
+	}
 
-    resultMsg := messaging.TaskResultMessage{
-        TaskID:      msg.TaskID,
-        JobID:       msg.JobID,
-        WorkerID:    c.workerID,
-        Status:      result.Status,
-        Output:      result.Output,
-        ErrorMessage: result.Error,
-        StartedAt:   result.StartedAt,
-        CompletedAt: result.CompletedAt,
-    }
+	c.insertTaskLog(ctx, taskUUID, "INFO", fmt.Sprintf("Task started (type=%s, timeout=%ds, retry=%d/%d)",
+		msg.Type, msg.TimeoutSeconds, msg.RetryCount, msg.MaxRetries))
 
-    data, err := resultMsg.ToJSON()
-    if err != nil {
-        c.logger.Errorw("Failed to serialize result message", "error", err)
-        return
-    }
+	result := c.executor.Execute(ctx, msg)
 
-    if err := c.resultWriter.WriteMessages(ctx, kafka.Message{
-        Key:   []byte(msg.JobID),
-        Value: data,
-    }); err != nil {
-        c.logger.Errorw("Failed to write result message", "error", err)
-    }
+	resultMsg := messaging.TaskResultMessage{
+		TaskID:       msg.TaskID,
+		JobID:        msg.JobID,
+		WorkerID:     c.workerID,
+		Status:       result.Status,
+		Output:       result.Output,
+		ErrorMessage: result.Error,
+		StartedAt:    result.StartedAt,
+		CompletedAt:  result.CompletedAt,
+	}
+
+	if result.Status == messaging.TaskStatusSuccess {
+		c.insertTaskLog(ctx, taskUUID, "INFO", "Task completed successfully")
+	} else {
+		c.insertTaskLog(ctx, taskUUID, "ERROR", "Task failed: "+result.Error)
+	}
+
+	data, err := resultMsg.ToJSON()
+	if err != nil {
+		c.logger.Errorw("Failed to serialize result message", "error", err)
+		return
+	}
+
+	if err := c.resultWriter.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(msg.JobID),
+		Value: data,
+	}); err != nil {
+		c.logger.Errorw("Failed to write result message", "error", err)
+	}
 }
 
 func (c *Consumer) tryAcquireLock(ctx context.Context, taskID uuid.UUID) (bool, error) {
@@ -182,11 +195,21 @@ func (c *Consumer) releaseLock(ctx context.Context, taskID uuid.UUID) error {
 }
 
 func (c *Consumer) setTaskRunning(ctx context.Context, taskID uuid.UUID) error {
-    _, err := c.dbPool.Exec(ctx,
-        "UPDATE tasks SET status = 'RUNNING', started_at = NOW(), worker_id = $1, updated_at = NOW() WHERE id = $2",
-        c.workerID, taskID,
-    )
-    return err
+	_, err := c.dbPool.Exec(ctx,
+		"UPDATE tasks SET status = 'RUNNING', started_at = NOW(), worker_id = $1, updated_at = NOW() WHERE id = $2",
+		c.workerID, taskID,
+	)
+	return err
+}
+
+func (c *Consumer) insertTaskLog(ctx context.Context, taskID uuid.UUID, level, message string) {
+	_, err := c.dbPool.Exec(ctx,
+		"INSERT INTO task_logs (task_id, worker_id, level, message, logged_at) VALUES ($1, $2, $3, $4, NOW())",
+		taskID, c.workerID, level, message,
+	)
+	if err != nil {
+		c.logger.Debugw("Failed to insert task log", "taskId", taskID, "error", err)
+	}
 }
 
 func (c *Consumer) SendHeartbeat(ctx context.Context) error {
@@ -198,5 +221,16 @@ func (c *Consumer) GetWorkerID() string {
 }
 
 func (c *Consumer) GetActiveTasks() int32 {
-    return atomic.LoadInt32(&c.activeTasks)
+	return atomic.LoadInt32(&c.activeTasks)
+}
+
+func (c *Consumer) WaitForCompletion(ctx context.Context, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&c.activeTasks) == 0 {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
