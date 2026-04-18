@@ -1,4 +1,5 @@
-CREATE TABLE jobs (
+-- Jobs: the top-level unit of work
+CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'RUNNING',
@@ -8,7 +9,8 @@ CREATE TABLE jobs (
     completed_at TIMESTAMPTZ
 );
 
-CREATE TABLE tasks (
+-- Tasks: individual units within a job
+CREATE TABLE IF NOT EXISTS tasks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
@@ -28,13 +30,15 @@ CREATE TABLE tasks (
     output JSONB
 );
 
-CREATE TABLE task_dependencies (
+-- Task dependency graph (edges of the DAG)
+CREATE TABLE IF NOT EXISTS task_dependencies (
     task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     dependency_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     PRIMARY KEY (task_id, dependency_id)
 );
 
-CREATE TABLE task_logs (
+-- Task execution logs
+CREATE TABLE IF NOT EXISTS task_logs (
     id BIGSERIAL PRIMARY KEY,
     task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     worker_id VARCHAR(255),
@@ -43,7 +47,8 @@ CREATE TABLE task_logs (
     logged_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE worker_heartbeats (
+-- Worker registry and health
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
     worker_id VARCHAR(255) PRIMARY KEY,
     hostname VARCHAR(255) NOT NULL,
     active_tasks INTEGER NOT NULL DEFAULT 0,
@@ -52,8 +57,9 @@ CREATE TABLE worker_heartbeats (
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_tasks_job_id ON tasks(job_id);
-CREATE INDEX idx_tasks_status ON tasks(status);
-CREATE INDEX idx_tasks_status_started_at ON tasks(status, started_at) WHERE status = 'RUNNING';
-CREATE INDEX idx_task_logs_task_id ON task_logs(task_id);
-CREATE INDEX idx_worker_heartbeats_last_seen ON worker_heartbeats(last_seen_at);
+-- Indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_tasks_job_id ON tasks(job_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_started_at ON tasks(status, started_at) WHERE status = 'RUNNING';
+CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id);
+CREATE INDEX IF NOT EXISTS idx_worker_heartbeats_last_seen ON worker_heartbeats(last_seen_at);

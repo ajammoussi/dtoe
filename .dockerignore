@@ -1,0 +1,15 @@
+.git
+.gitignore
+.idea
+.vscode
+**/target
+**/*.log
+**/*.class
+**/*.jar
+!**/src
+**/node_modules
+hah.txt
+lombok.jar
+dashboard
+docs
+examples

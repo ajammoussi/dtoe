@@ -59,15 +59,12 @@ management:
         enabled: true
 
 dtoe:
-  scheduler:
-    interval-ms: ${DTOE_SCHEDULER_INTERVAL_MS:5000}
-    timeout-check-ms: ${DTOE_SCHEDULER_TIMEOUT_CHECK_MS:10000}
   worker:
     dead-threshold-seconds: ${DTOE_WORKER_DEAD_THRESHOLD_SECONDS:60}
   kafka:
     topics:
-      task-queue: task-queue
-      task-results: task-results
+      task-queue: ${DTOE_KAFKA_TOPICS_TASK_QUEUE:task-queue}
+      task-results: ${DTOE_KAFKA_TOPICS_TASK_RESULTS:task-results}
 
 logging:
   level:

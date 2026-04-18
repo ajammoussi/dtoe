@@ -1,0 +1,152 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dtoe-postgres
+    environment:
+      POSTGRES_DB: dtoe
+      POSTGRES_USER: dtoe
+      POSTGRES_PASSWORD: dtoe
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dtoe"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dtoe-network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: dtoe-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - dtoe-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: dtoe-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 12
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - dtoe-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dtoe-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9093
+    networks:
+      - dtoe-network
+
+  master:
+    build:
+      context: .
+      dockerfile: master/Dockerfile
+    container_name: dtoe-master
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/dtoe
+      SPRING_DATASOURCE_USERNAME: dtoe
+      SPRING_DATASOURCE_PASSWORD: dtoe
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      DTOE_KAFKA_TOPICS_TASK_QUEUE: task-queue
+      DTOE_KAFKA_TOPICS_TASK_RESULTS: task-results
+      DTOE_WORKER_DEAD_THRESHOLD_SECONDS: 60
+    networks:
+      - dtoe-network
+
+  scheduler:
+    build:
+      context: ./scheduler
+      dockerfile: Dockerfile
+    container_name: dtoe-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      DTOE_DATABASE_HOST: postgres
+      DTOE_DATABASE_PORT: 5432
+      DTOE_DATABASE_USER: dtoe
+      DTOE_DATABASE_PASSWORD: dtoe
+      DTOE_DATABASE_DATABASE: dtoe
+      DTOE_KAFKA_BROKERS: kafka:9093
+      DTOE_KAFKA_TASK_QUEUE_TOPIC: task-queue
+      DTOE_SCHEDULER_POLL_INTERVAL_MS: 5000
+      DTOE_SCHEDULER_TIMEOUT_CHECK_MS: 10000
+    networks:
+      - dtoe-network
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: dtoe-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    environment:
+      DTOE_DATABASE_HOST: postgres
+      DTOE_DATABASE_PORT: 5432
+      DTOE_DATABASE_USER: dtoe
+      DTOE_DATABASE_PASSWORD: dtoe
+      DTOE_DATABASE_DATABASE: dtoe
+      DTOE_KAFKA_BROKERS: kafka:9093
+      DTOE_KAFKA_TASK_QUEUE_TOPIC: task-queue
+      DTOE_KAFKA_TASK_RESULT_TOPIC: task-results
+      DTOE_KAFKA_CONSUMER_GROUP: worker-group
+      DTOE_WORKER_THREAD_POOL_SIZE: 8
+      DTOE_WORKER_HEARTBEAT_INTERVAL_MS: 5000
+    networks:
+      - dtoe-network
+
+volumes:
+  postgres_data:
+
+networks:
+  dtoe-network:
+    driver: bridge
