@@ -16,4 +16,7 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
 
     @Query("SELECT j FROM Job j LEFT JOIN FETCH j.tasks WHERE j.id = :id")
     Optional<Job> findByIdWithTasks(UUID id);
+
+    @Query("SELECT j FROM Job j LEFT JOIN FETCH j.tasks t WHERE t.id = :taskId")
+    Optional<Job> findByTaskIdWithTasks(UUID taskId);
 }

@@ -148,15 +148,53 @@ public class JobService {
 
     private JobDetailResponse.TaskSummary toTaskSummary(Task task) {
         return JobDetailResponse.TaskSummary.builder()
-                .taskId(task.getId())
-                .name(task.getName())
-                .type(task.getType())
-                .status(task.getStatus())
-                .workerId(task.getWorkerId())
-                .retryCount(task.getRetryCount())
-                .startedAt(task.getStartedAt())
-                .completedAt(task.getCompletedAt())
-                .dependencies(task.getDependencies().stream().map(Task::getId).toList())
-                .build();
+            .taskId(task.getId())
+            .name(task.getName())
+            .type(task.getType())
+            .status(task.getStatus())
+            .workerId(task.getWorkerId())
+            .retryCount(task.getRetryCount())
+            .startedAt(task.getStartedAt())
+            .completedAt(task.getCompletedAt())
+            .dependencies(task.getDependencies().stream().map(Task::getId).toList())
+            .build();
+    }
+
+    @Transactional
+    public void checkAndUpdateJobCompletion(UUID jobId) {
+        jobRepository.findByIdWithTasks(jobId).ifPresent(job -> {
+            if (job.isTerminal()) {
+                return;
+            }
+
+            List<Task> tasks = job.getTasks();
+            boolean allTerminal = tasks.stream().allMatch(Task::isTerminal);
+
+            if (!allTerminal) {
+                return;
+            }
+
+            boolean allSuccess = tasks.stream().allMatch(t -> t.getStatus() == TaskStatus.SUCCESS);
+            boolean anyFailed = tasks.stream().anyMatch(t -> 
+                t.getStatus() == TaskStatus.FAILED || 
+                t.getStatus() == TaskStatus.TIMED_OUT ||
+                t.getStatus() == TaskStatus.CANCELLED
+            );
+
+            JobStatus finalStatus;
+            if (allSuccess) {
+                finalStatus = JobStatus.SUCCESS;
+            } else if (anyFailed) {
+                finalStatus = JobStatus.FAILED;
+            } else {
+                finalStatus = JobStatus.CANCELLED;
+            }
+
+            job.setStatus(finalStatus);
+            job.setCompletedAt(Instant.now());
+            jobRepository.save(job);
+
+            log.info("Job {} completed with status: {}", job.getId(), finalStatus);
+        });
     }
 }

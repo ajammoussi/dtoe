@@ -18,6 +18,9 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
     @Query("SELECT t FROM Task t LEFT JOIN FETCH t.job WHERE t.id = :id")
     Optional<Task> findByIdWithJob(UUID id);
 
+    @Query("SELECT t FROM Task t LEFT JOIN FETCH t.job LEFT JOIN FETCH t.dependents WHERE t.id = :id")
+    Optional<Task> findByIdWithJobAndDependents(UUID id);
+
     List<Task> findByJobIdAndStatusIn(UUID jobId, List<TaskStatus> statuses);
 
     @Query("""
