@@ -12,6 +12,7 @@ import (
 	"github.com/dtoe/scheduler/internal/config"
 	"github.com/dtoe/scheduler/internal/db"
 	"github.com/dtoe/scheduler/internal/scheduler"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"
 	gozap "go.uber.org/zap"
 )
@@ -109,6 +110,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
+	http.Handle("/metrics", promhttp.Handler())
 
 	httpServer := &http.Server{Addr: ":8081"}
 	go func() {

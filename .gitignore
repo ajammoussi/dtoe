@@ -63,3 +63,7 @@ vendor/
 bin/
 scheduler/scheduler
 worker/worker
+
+# Typescript
+node_modules/
+dist/

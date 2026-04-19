@@ -11,6 +11,7 @@ import (
 
 	"github.com/dtoe/worker/internal/config"
 	"github.com/dtoe/worker/internal/kafka"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	gozap "go.uber.org/zap"
 )
 
@@ -71,6 +72,7 @@ func main() {
 		fmt.Fprintf(w, `{"status":"OK","workerId":"%s","activeTasks":%d}`,
 			consumer.GetWorkerID(), consumer.GetActiveTasks())
 	})
+	http.Handle("/metrics", promhttp.Handler())
 
 	httpServer := &http.Server{Addr: ":8082"}
 	go func() {

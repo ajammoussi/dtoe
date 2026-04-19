@@ -9,6 +9,7 @@ import (
 	"github.com/dtoe/go_shared/pkg/messaging"
 	"github.com/dtoe/scheduler/internal/config"
 	"github.com/dtoe/scheduler/internal/db"
+	"github.com/dtoe/scheduler/internal/metrics"
 	"github.com/segmentio/kafka-go"
 	gozap "go.uber.org/zap"
 )
@@ -35,6 +36,7 @@ func NewScheduler(repo *db.Repository, kafkaWriter *kafka.Writer, cfg *config.Sc
 }
 
 func (s *Scheduler) PromoteReadyTasks(ctx context.Context) error {
+	start := time.Now()
 	tasks, err := s.repo.FindReadyTasks(ctx)
 	if err != nil {
 		return err
@@ -51,9 +53,12 @@ func (s *Scheduler) PromoteReadyTasks(ctx context.Context) error {
 			s.logger.Errorw("Failed to enqueue task", "taskId", task.ID, "error", err)
 			continue
 		}
+		metrics.SchedulerTasksPromoted.Inc()
+		metrics.KafkaMessagesProduced.Inc()
 		s.logger.Debugw("Promoted task to QUEUED", "taskId", task.ID)
 	}
 
+	metrics.SchedulerPollDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
@@ -121,6 +126,7 @@ func (s *Scheduler) EnforceTimeouts(ctx context.Context) error {
 
 	for _, task := range tasks {
 		s.logger.Warnw("Task timed out", "taskId", task.ID, "timeoutSeconds", task.TimeoutSeconds)
+		metrics.TaskTimeoutsTotal.Inc()
 
 		if err := s.repo.SetTaskTimedOut(ctx, task.ID); err != nil {
 			s.logger.Errorw("Failed to set task timed out", "taskId", task.ID, "error", err)

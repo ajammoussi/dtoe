@@ -1,7 +1,5 @@
 package messaging
 
-import "time"
-
 type TaskStatus string
 
 const (
