@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -21,7 +19,7 @@ services:
       - dtoe-network
 
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
+    image: confluentinc/cp-zookeeper:7.6.1
     container_name: dtoe-zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -32,7 +30,7 @@ services:
       - dtoe-network
 
   kafka:
-    image: confluentinc/cp-kafka:7.5.0
+    image: confluentinc/cp-kafka:7.6.1
     container_name: dtoe-kafka
     depends_on:
       - zookeeper
@@ -161,7 +159,7 @@ services:
       - dtoe-network
 
   grafana:
-    image: grafana/grafana:10.4.0
+    image: grafana/grafana:10.4.2
     container_name: dtoe-grafana
     ports:
       - "3001:3000"
