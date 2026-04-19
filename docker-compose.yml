@@ -143,57 +143,58 @@ services:
       DTOE_WORKER_HEARTBEAT_INTERVAL_MS: 5000
     networks:
       - dtoe-network
-  prometheus:
-    image: prom/prometheus:v2.52.0
-    container_name: dtoe-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
-    networks:
-      - dtoe-network
-
-  grafana:
-    image: grafana/grafana:10.4.0
-    container_name: dtoe-grafana
-    ports:
-      - "3001:3000"
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    volumes:
-      - grafana_data:/var/lib/grafana
-    depends_on:
-      - prometheus
-    networks:
-      - dtoe-network
-
-  dashboard:
-    build:
-      context: ./dashboard
-      dockerfile: Dockerfile
-    container_name: dtoe-dashboard
-    ports:
-      - "3000:3000"
-    environment:
-      VITE_API_BASE_URL: http://master:8080
-    depends_on:
-      - master
-    networks:
-      - dtoe-network
 
 volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
+
+prometheus:
+  image: prom/prometheus:v2.52.0
+  container_name: dtoe-prometheus
+  ports:
+    - "9090:9090"
+  volumes:
+    - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    - prometheus_data:/prometheus
+  command:
+    - '--config.file=/etc/prometheus/prometheus.yml'
+    - '--storage.tsdb.path=/prometheus'
+    - '--web.console.libraries=/etc/prometheus/console_libraries'
+    - '--web.console.templates=/etc/prometheus/consoles'
+    - '--web.enable-lifecycle'
+  networks:
+    - dtoe-network
+
+grafana:
+  image: grafana/grafana:10.4.0
+  container_name: dtoe-grafana
+  ports:
+    - "3001:3000"
+  environment:
+    GF_SECURITY_ADMIN_USER: admin
+    GF_SECURITY_ADMIN_PASSWORD: admin
+    GF_USERS_ALLOW_SIGN_UP: "false"
+  volumes:
+    - grafana_data:/var/lib/grafana
+  depends_on:
+    - prometheus
+  networks:
+    - dtoe-network
+
+dashboard:
+  build:
+    context: ./dashboard
+    dockerfile: Dockerfile
+  container_name: dtoe-dashboard
+  ports:
+    - "3000:3000"
+  environment:
+    VITE_API_BASE_URL: http://master:8080
+  depends_on:
+    - master
+  networks:
+    - dtoe-network
 
 networks:
   dtoe-network:
