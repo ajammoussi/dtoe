@@ -46,110 +46,128 @@ func (r *Repository) Close() {
 	r.pool.Close()
 }
 
-func (r *Repository) FindReadyTasks(ctx context.Context) ([]Task, error) {
-	query := `
-		SELECT t.id, t.job_id, t.name, t.type, t.payload, t.status,
-		       t.retry_count, t.max_retries, t.timeout_seconds, t.worker_id,
-		       t.created_at, t.updated_at, t.queued_at, t.started_at, t.completed_at, t.error_message, t.scheduled_for
-		FROM tasks t
-		WHERE t.status = 'PENDING'
-		AND NOT EXISTS (
-			SELECT 1 FROM task_dependencies td
-			JOIN tasks dep ON dep.id = td.dependency_id
-			WHERE td.task_id = t.id
-			AND dep.status != 'SUCCESS'
-		)
-		FOR UPDATE SKIP LOCKED
-	`
+// claimColumns is the RETURNING list shared by the two claiming statements; it
+// must match scanTask's order.
+const claimColumns = `id, job_id, name, type, payload, status,
+	       retry_count, max_retries, timeout_seconds, worker_id,
+	       created_at, updated_at, queued_at, started_at, completed_at, error_message, scheduled_for`
 
-	rows, err := r.pool.Query(ctx, query)
+func scanTask(row pgx.CollectableRow) (Task, error) {
+	var t Task
+	err := row.Scan(
+		&t.ID, &t.JobID, &t.Name, &t.Type, &t.Payload, &t.Status,
+		&t.RetryCount, &t.MaxRetries, &t.TimeoutSeconds, &t.WorkerID,
+		&t.CreatedAt, &t.UpdatedAt, &t.QueuedAt, &t.StartedAt, &t.CompletedAt, &t.ErrorMessage, &t.ScheduledFor,
+	)
+	return t, err
+}
+
+// ClaimReadyTasks transitions up to limit dependency-satisfied PENDING tasks to
+// QUEUED and returns the new rows. The transition happens inside the statement,
+// so concurrent schedulers cannot claim the same task.
+func (r *Repository) ClaimReadyTasks(ctx context.Context, limit int) ([]Task, error) {
+	query := `
+		WITH ready AS (
+			SELECT t.id FROM tasks t
+			 WHERE t.status = 'PENDING'
+			   AND NOT EXISTS (
+					SELECT 1 FROM task_dependencies td
+					JOIN tasks dep ON dep.id = td.dependency_id
+					WHERE td.task_id = t.id
+					AND dep.status != 'SUCCESS'
+			   )
+			 ORDER BY t.created_at
+			 LIMIT $1
+			 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE tasks SET status = 'QUEUED', queued_at = NOW(), updated_at = NOW()
+		 WHERE id IN (SELECT id FROM ready)
+		RETURNING ` + claimColumns
+
+	rows, err := r.pool.Query(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Task, error) {
-		var t Task
-		err := row.Scan(
-			&t.ID, &t.JobID, &t.Name, &t.Type, &t.Payload, &t.Status,
-			&t.RetryCount, &t.MaxRetries, &t.TimeoutSeconds, &t.WorkerID,
-			&t.CreatedAt, &t.UpdatedAt, &t.QueuedAt, &t.StartedAt, &t.CompletedAt, &t.ErrorMessage, &t.ScheduledFor,
-		)
-		return t, err
-	})
+	return pgx.CollectRows(rows, scanTask)
 }
 
-func (r *Repository) FindTasksReadyForRetry(ctx context.Context) ([]Task, error) {
+// ClaimRetryTasks transitions up to limit due RETRYING tasks to QUEUED. It keeps
+// scheduled_for so a failed publish can revert exactly this promotion.
+func (r *Repository) ClaimRetryTasks(ctx context.Context, limit int) ([]Task, error) {
 	query := `
-		SELECT t.id, t.job_id, t.name, t.type, t.payload, t.status,
-		       t.retry_count, t.max_retries, t.timeout_seconds, t.worker_id,
-		       t.created_at, t.updated_at, t.queued_at, t.started_at, t.completed_at, t.error_message, t.scheduled_for
-		FROM tasks t
-		WHERE t.status = 'RETRYING'
-		AND t.scheduled_for IS NOT NULL
-		AND t.scheduled_for <= NOW()
-		FOR UPDATE SKIP LOCKED
-	`
+		WITH due AS (
+			SELECT id FROM tasks
+			 WHERE status = 'RETRYING'
+			   AND scheduled_for IS NOT NULL
+			   AND scheduled_for <= NOW()
+			 ORDER BY scheduled_for
+			 LIMIT $1
+			 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE tasks SET status = 'QUEUED', queued_at = NOW(), updated_at = NOW()
+		 WHERE id IN (SELECT id FROM due)
+		RETURNING ` + claimColumns
 
-	rows, err := r.pool.Query(ctx, query)
+	rows, err := r.pool.Query(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Task, error) {
-		var t Task
-		err := row.Scan(
-			&t.ID, &t.JobID, &t.Name, &t.Type, &t.Payload, &t.Status,
-			&t.RetryCount, &t.MaxRetries, &t.TimeoutSeconds, &t.WorkerID,
-			&t.CreatedAt, &t.UpdatedAt, &t.QueuedAt, &t.StartedAt, &t.CompletedAt, &t.ErrorMessage, &t.ScheduledFor,
-		)
-		return t, err
-	})
+	return pgx.CollectRows(rows, scanTask)
 }
 
-func (r *Repository) FindTimedOutTasks(ctx context.Context) ([]Task, error) {
+// RevertQueuedToPending undoes a promotion whose Kafka publish failed.
+func (r *Repository) RevertQueuedToPending(ctx context.Context, taskID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		"UPDATE tasks SET status = 'PENDING', queued_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'QUEUED'",
+		taskID,
+	)
+	return err
+}
+
+// RevertQueuedToRetrying undoes a retry promotion whose Kafka publish failed.
+// scheduled_for is unchanged, so the next poll retries it again.
+func (r *Repository) RevertQueuedToRetrying(ctx context.Context, taskID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		"UPDATE tasks SET status = 'RETRYING', queued_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'QUEUED'",
+		taskID,
+	)
+	return err
+}
+
+// RequeueStaleQueued returns QUEUED tasks whose message was never consumed
+// (broker loss, crash between publish and consume) to PENDING.
+func (r *Repository) RequeueStaleQueued(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		"UPDATE tasks SET status = 'PENDING', queued_at = NULL, updated_at = NOW() WHERE status = 'QUEUED' AND queued_at < $1",
+		cutoff,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (r *Repository) FindTimedOutTasks(ctx context.Context, graceSeconds int) ([]Task, error) {
 	query := `
 		SELECT id, job_id, name, type, payload, status,
 		       retry_count, max_retries, timeout_seconds, worker_id,
 		       created_at, updated_at, queued_at, started_at, completed_at, error_message, scheduled_for
 		FROM tasks
 		WHERE status = 'RUNNING'
-		AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second')
-		FOR UPDATE SKIP LOCKED
+		AND started_at < NOW() - ((timeout_seconds + $1) * INTERVAL '1 second')
 	`
 
-	rows, err := r.pool.Query(ctx, query)
+	rows, err := r.pool.Query(ctx, query, graceSeconds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Task, error) {
-		var t Task
-		err := row.Scan(
-			&t.ID, &t.JobID, &t.Name, &t.Type, &t.Payload, &t.Status,
-			&t.RetryCount, &t.MaxRetries, &t.TimeoutSeconds, &t.WorkerID,
-			&t.CreatedAt, &t.UpdatedAt, &t.QueuedAt, &t.StartedAt, &t.CompletedAt, &t.ErrorMessage, &t.ScheduledFor,
-		)
-		return t, err
-	})
-}
-
-func (r *Repository) UpdateTaskStatus(ctx context.Context, taskID uuid.UUID, status messaging.TaskStatus) error {
-	_, err := r.pool.Exec(ctx,
-		"UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2",
-		string(status), taskID,
-	)
-	return err
-}
-
-func (r *Repository) SetTaskQueued(ctx context.Context, taskID uuid.UUID) error {
-	_, err := r.pool.Exec(ctx,
-		"UPDATE tasks SET status = 'QUEUED', queued_at = NOW(), scheduled_for = NULL, updated_at = NOW() WHERE id = $1",
-		taskID,
-	)
-	return err
+	return pgx.CollectRows(rows, scanTask)
 }
 
 func (r *Repository) SetTaskTimedOut(ctx context.Context, taskID uuid.UUID) error {
@@ -162,7 +180,7 @@ func (r *Repository) SetTaskTimedOut(ctx context.Context, taskID uuid.UUID) erro
 
 func (r *Repository) SetTaskRetryingWithBackoff(ctx context.Context, taskID uuid.UUID, scheduledFor time.Time) error {
 	_, err := r.pool.Exec(ctx,
-		"UPDATE tasks SET status = 'RETRYING', scheduled_for = $1, completed_at = NULL, updated_at = NOW() WHERE id = $2",
+		"UPDATE tasks SET status = 'RETRYING', retry_count = retry_count + 1, scheduled_for = $1, completed_at = NULL, updated_at = NOW() WHERE id = $2",
 		scheduledFor, taskID,
 	)
 	return err

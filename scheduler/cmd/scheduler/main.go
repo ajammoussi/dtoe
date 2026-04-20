@@ -78,7 +78,8 @@ func main() {
 	timeoutTicker := time.NewTicker(cfg.Scheduler.TimeoutCheckInterval())
 	defer timeoutTicker.Stop()
 
-	runningTasks := make(map[string]context.CancelFunc)
+	staleTicker := time.NewTicker(30 * time.Second)
+	defer staleTicker.Stop()
 
 	go func() {
 		for {
@@ -94,6 +95,13 @@ func main() {
 			case <-timeoutTicker.C:
 				if err := sched.EnforceTimeouts(ctx); err != nil {
 					sugar.Errorw("Failed to enforce timeouts", "error", err)
+				}
+			case <-staleTicker.C:
+				requeued, err := sched.RequeueStaleQueued(ctx, 5*time.Minute)
+				if err != nil {
+					sugar.Errorw("Failed to requeue stale queued tasks", "error", err)
+				} else if requeued > 0 {
+					sugar.Warnw("Requeued stale QUEUED tasks", "count", requeued)
 				}
 			case <-ctx.Done():
 				return
@@ -112,7 +120,7 @@ func main() {
 	})
 	http.Handle("/metrics", promhttp.Handler())
 
-	httpServer := &http.Server{Addr: ":8081"}
+	httpServer := &http.Server{Addr: ":8081", ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			sugar.Errorf("HTTP server error: %v", err)
@@ -125,11 +133,6 @@ func main() {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
-
-	for taskID, cancelTask := range runningTasks {
-		sugar.Debugw("Cancelling running task", "taskId", taskID)
-		cancelTask()
-	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		sugar.Errorw("HTTP server shutdown error", "error", err)

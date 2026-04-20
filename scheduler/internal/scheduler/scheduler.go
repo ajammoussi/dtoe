@@ -17,6 +17,10 @@ import (
 const (
 	baseDelaySeconds = 2
 	maxDelaySeconds  = 60
+	promotionBatch   = 100
+	// Workers enforce their own deadline and report TIMED_OUT first, so this
+	// grace only recovers tasks whose worker died before publishing a result.
+	timeoutGraceSeconds = 30
 )
 
 type Scheduler struct {
@@ -37,7 +41,9 @@ func NewScheduler(repo *db.Repository, kafkaWriter *kafka.Writer, cfg *config.Sc
 
 func (s *Scheduler) PromoteReadyTasks(ctx context.Context) error {
 	start := time.Now()
-	tasks, err := s.repo.FindReadyTasks(ctx)
+	defer func() { metrics.SchedulerPollDuration.Observe(time.Since(start).Seconds()) }()
+
+	tasks, err := s.repo.ClaimReadyTasks(ctx, promotionBatch)
 	if err != nil {
 		return err
 	}
@@ -49,8 +55,12 @@ func (s *Scheduler) PromoteReadyTasks(ctx context.Context) error {
 	s.logger.Infow("Promoting ready tasks", "count", len(tasks))
 
 	for _, task := range tasks {
-		if err := s.enqueueTask(ctx, task); err != nil {
-			s.logger.Errorw("Failed to enqueue task", "taskId", task.ID, "error", err)
+		if err := s.publish(ctx, task); err != nil {
+			metrics.KafkaProduceErrors.Inc()
+			s.logger.Errorw("Failed to publish task, reverting to PENDING", "taskId", task.ID, "error", err)
+			if revertErr := s.repo.RevertQueuedToPending(context.WithoutCancel(ctx), task.ID); revertErr != nil {
+				s.logger.Errorw("Failed to revert task to PENDING", "taskId", task.ID, "error", revertErr)
+			}
 			continue
 		}
 		metrics.SchedulerTasksPromoted.Inc()
@@ -58,12 +68,11 @@ func (s *Scheduler) PromoteReadyTasks(ctx context.Context) error {
 		s.logger.Debugw("Promoted task to QUEUED", "taskId", task.ID)
 	}
 
-	metrics.SchedulerPollDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
 func (s *Scheduler) PromoteRetryingTasks(ctx context.Context) error {
-	tasks, err := s.repo.FindTasksReadyForRetry(ctx)
+	tasks, err := s.repo.ClaimRetryTasks(ctx, promotionBatch)
 	if err != nil {
 		return err
 	}
@@ -75,21 +84,23 @@ func (s *Scheduler) PromoteRetryingTasks(ctx context.Context) error {
 	s.logger.Infow("Promoting retrying tasks", "count", len(tasks))
 
 	for _, task := range tasks {
-		if err := s.enqueueTask(ctx, task); err != nil {
-			s.logger.Errorw("Failed to enqueue retrying task", "taskId", task.ID, "error", err)
+		if err := s.publish(ctx, task); err != nil {
+			metrics.KafkaProduceErrors.Inc()
+			s.logger.Errorw("Failed to publish retrying task, reverting to RETRYING", "taskId", task.ID, "error", err)
+			if revertErr := s.repo.RevertQueuedToRetrying(context.WithoutCancel(ctx), task.ID); revertErr != nil {
+				s.logger.Errorw("Failed to revert task to RETRYING", "taskId", task.ID, "error", revertErr)
+			}
 			continue
 		}
+		metrics.TaskRetriesTotal.Inc()
+		metrics.KafkaMessagesProduced.Inc()
 		s.logger.Infow("Promoted retrying task to QUEUED", "taskId", task.ID, "retryCount", task.RetryCount)
 	}
 
 	return nil
 }
 
-func (s *Scheduler) enqueueTask(ctx context.Context, task db.Task) error {
-	if err := s.repo.SetTaskQueued(ctx, task.ID); err != nil {
-		return err
-	}
-
+func (s *Scheduler) publish(ctx context.Context, task db.Task) error {
 	msg := messaging.TaskMessage{
 		TaskID:         task.ID.String(),
 		JobID:          task.JobID.String(),
@@ -98,7 +109,7 @@ func (s *Scheduler) enqueueTask(ctx context.Context, task db.Task) error {
 		TimeoutSeconds: task.TimeoutSeconds,
 		RetryCount:     task.RetryCount,
 		MaxRetries:     task.MaxRetries,
-		EnqueuedAt:     time.Now(),
+		EnqueuedAt:     messaging.CustomTime{Time: time.Now()},
 	}
 
 	data, err := msg.ToJSON()
@@ -113,7 +124,7 @@ func (s *Scheduler) enqueueTask(ctx context.Context, task db.Task) error {
 }
 
 func (s *Scheduler) EnforceTimeouts(ctx context.Context) error {
-	tasks, err := s.repo.FindTimedOutTasks(ctx)
+	tasks, err := s.repo.FindTimedOutTasks(ctx, timeoutGraceSeconds)
 	if err != nil {
 		return err
 	}
@@ -169,6 +180,12 @@ func (s *Scheduler) EnforceTimeouts(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// RequeueStaleQueued returns QUEUED tasks older than olderThan to PENDING so a
+// message lost between publish and consume cannot strand a task forever.
+func (s *Scheduler) RequeueStaleQueued(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return s.repo.RequeueStaleQueued(ctx, time.Now().Add(-olderThan))
 }
 
 func (s *Scheduler) calculateBackoff(retryCount int) time.Duration {
