@@ -15,15 +15,20 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/v1/jobs")
 @RequiredArgsConstructor
 public class JobController {
+
+    private static final Set<String> SORTABLE_PROPERTIES = Set.of("createdAt", "updatedAt", "name", "status");
 
     private final JobService jobService;
 
@@ -40,14 +45,31 @@ public class JobController {
             @RequestParam(defaultValue = "20") int size,
             @RequestParam(defaultValue = "createdAt,desc") String sort) {
 
-        String[] sortParts = sort.split(",");
-        Sort.Direction direction = sortParts.length > 1 
-                ? Sort.Direction.fromString(sortParts[1]) 
-                : Sort.Direction.DESC;
-        Pageable pageable = PageRequest.of(page, Math.min(size, 100), Sort.by(direction, sortParts[0]));
-
+        Pageable pageable = toPageable(page, size, sort);
         Page<JobSummaryResponse> jobs = jobService.listJobs(status, pageable);
         return ResponseEntity.ok(jobs);
+    }
+
+    private static Pageable toPageable(int page, int size, String sort) {
+        String[] sortParts = sort == null ? new String[0] : sort.split(",");
+        String property = sortParts.length > 0 ? sortParts[0].trim() : "";
+        if (!SORTABLE_PROPERTIES.contains(property)) {
+            sortParts = new String[] {"createdAt", "desc"};
+            property = "createdAt";
+        }
+
+        Sort.Direction direction = Sort.Direction.DESC;
+        if (sortParts.length > 1) {
+            try {
+                direction = Sort.Direction.fromString(sortParts[1].trim());
+            } catch (IllegalArgumentException ignored) {
+                // unknown direction: keep DESC
+            }
+        }
+
+        int safePage = Math.max(0, page);
+        int safeSize = Math.min(Math.max(1, size), 100);
+        return PageRequest.of(safePage, safeSize, Sort.by(direction, property));
     }
 
     @GetMapping("/{jobId}")
@@ -66,6 +88,16 @@ public class JobController {
                         "message", "Job cancelled successfully"
                 )))
                 .orElse(ResponseEntity.notFound().build());
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors()
+                .forEach(error -> fields.put(error.getField(), error.getDefaultMessage()));
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(Map.of("error", "Validation failed", "fields", fields));
     }
 
     @ExceptionHandler(DagValidationService.DagValidationException.class)

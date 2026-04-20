@@ -35,6 +35,8 @@ public class JobDetailResponse {
         private TaskStatus status;
         private String workerId;
         private int retryCount;
+        private int maxRetries;
+        private int timeoutSeconds;
         private Instant startedAt;
         private Instant completedAt;
         private List<UUID> dependencies;

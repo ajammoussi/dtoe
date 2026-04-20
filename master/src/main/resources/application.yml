@@ -26,11 +26,6 @@ spring:
 
   kafka:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-      acks: all
-      retries: 3
     consumer:
       group-id: dtoe-master
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -63,7 +58,6 @@ dtoe:
     dead-threshold-seconds: ${DTOE_WORKER_DEAD_THRESHOLD_SECONDS:60}
   kafka:
     topics:
-      task-queue: ${DTOE_KAFKA_TOPICS_TASK_QUEUE:task-queue}
       task-results: ${DTOE_KAFKA_TOPICS_TASK_RESULTS:task-results}
 
 logging:

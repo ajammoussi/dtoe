@@ -3,7 +3,7 @@ package com.dtoe.master.domain;
 import com.dtoe.shared.enums.TaskStatus;
 import jakarta.persistence.*;
 import lombok.*;
-import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.BatchSize;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.annotations.UpdateTimestamp;
 import org.hibernate.type.SqlTypes;
@@ -57,7 +57,6 @@ public class Task {
 
     private String workerId;
 
-    @CreationTimestamp
     private Instant createdAt;
 
     @UpdateTimestamp
@@ -66,6 +65,7 @@ public class Task {
     private Instant queuedAt;
     private Instant startedAt;
     private Instant completedAt;
+    private Instant scheduledFor;
 
     private String errorMessage;
 
@@ -79,6 +79,7 @@ public class Task {
             joinColumns = @JoinColumn(name = "task_id"),
             inverseJoinColumns = @JoinColumn(name = "dependency_id")
     )
+    @BatchSize(size = 100)
     @Builder.Default
     private List<Task> dependencies = new ArrayList<>();
 
@@ -95,5 +96,12 @@ public class Task {
 
     public boolean canRetry() {
         return retryCount < maxRetries;
+    }
+
+    @PrePersist
+    protected void onCreate() {
+        if (createdAt == null) {
+            createdAt = Instant.now();
+        }
     }
 }

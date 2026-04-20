@@ -7,7 +7,6 @@ import com.dtoe.master.dto.request.TaskDefinitionRequest;
 import com.dtoe.master.dto.response.JobDetailResponse;
 import com.dtoe.master.dto.response.JobSubmitResponse;
 import com.dtoe.master.dto.response.JobSummaryResponse;
-import com.dtoe.master.kafka.TaskQueueProducer;
 import com.dtoe.master.repository.JobRepository;
 import com.dtoe.master.repository.TaskRepository;
 import com.dtoe.shared.enums.JobStatus;
@@ -21,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -30,7 +30,6 @@ public class JobService {
     private final JobRepository jobRepository;
     private final TaskRepository taskRepository;
     private final DagValidationService dagValidationService;
-    private final TaskQueueProducer taskQueueProducer;
 
     @Transactional
     public JobSubmitResponse submitJob(JobSubmitRequest request) {
@@ -59,18 +58,13 @@ public class JobService {
 
         for (TaskDefinitionRequest taskDef : request.getTasks()) {
             Task task = tasksByLogicalId.get(taskDef.getId());
-            List<Task> deps = taskDef.getDependencies().stream()
+            List<String> rawDeps = taskDef.getDependencies() != null ? taskDef.getDependencies() : List.of();
+            List<Task> deps = rawDeps.stream()
                     .map(tasksByLogicalId::get)
-                    .toList();
+                    .filter(Objects::nonNull)
+                    .collect(java.util.stream.Collectors.toList());
             task.setDependencies(deps);
             taskRepository.save(task);
-        }
-
-        for (TaskDefinitionRequest taskDef : request.getTasks()) {
-            if (taskDef.getDependencies().isEmpty()) {
-                Task rootTask = tasksByLogicalId.get(taskDef.getId());
-                enqueueTask(rootTask);
-            }
         }
 
         log.info("Job {} submitted with {} tasks", job.getId(), request.getTasks().size());
@@ -85,25 +79,25 @@ public class JobService {
     }
 
     @Transactional
-    public void enqueueTask(Task task) {
-        task.setStatus(TaskStatus.QUEUED);
-        task.setQueuedAt(Instant.now());
-        taskRepository.save(task);
-        taskQueueProducer.publish(task);
-        log.debug("Task {} enqueued", task.getId());
-    }
-
-    @Transactional
     public Optional<Job> cancelJob(UUID jobId) {
         return jobRepository.findByIdWithTasks(jobId).map(job -> {
             if (job.isTerminal()) {
                 throw new IllegalStateException("Job " + jobId + " is already in terminal state: " + job.getStatus());
             }
+            Instant now = Instant.now();
             job.getTasks().stream()
-                    .filter(t -> t.getStatus() == TaskStatus.PENDING || t.getStatus() == TaskStatus.QUEUED)
-                    .forEach(t -> t.setStatus(TaskStatus.CANCELLED));
+                    .filter(t -> t.getStatus() == TaskStatus.PENDING
+                            || t.getStatus() == TaskStatus.QUEUED
+                            || t.getStatus() == TaskStatus.RETRYING)
+                    .forEach(t -> {
+                        t.setStatus(TaskStatus.CANCELLED);
+                        t.setScheduledFor(null);
+                        if (t.getCompletedAt() == null) {
+                            t.setCompletedAt(now);
+                        }
+                    });
             job.setStatus(JobStatus.CANCELLED);
-            job.setCompletedAt(Instant.now());
+            job.setCompletedAt(now);
             return jobRepository.save(job);
         });
     }
@@ -113,7 +107,14 @@ public class JobService {
         Page<Job> jobs = status != null
                 ? jobRepository.findByStatus(status, pageable)
                 : jobRepository.findAll(pageable);
-        return jobs.map(this::toSummaryResponse);
+
+        List<UUID> jobIds = jobs.getContent().stream().map(Job::getId).toList();
+        Map<UUID, TaskRepository.JobTaskCounts> counts = jobIds.isEmpty()
+                ? Map.of()
+                : taskRepository.countTasksByJobIds(jobIds, TaskStatus.SUCCESS).stream()
+                        .collect(Collectors.toMap(TaskRepository.JobTaskCounts::getJobId, c -> c));
+
+        return jobs.map(job -> toSummaryResponse(job, counts.get(job.getId())));
     }
 
     @Transactional(readOnly = true)
@@ -121,15 +122,13 @@ public class JobService {
         return jobRepository.findByIdWithTasks(jobId).map(this::toDetailResponse);
     }
 
-    private JobSummaryResponse toSummaryResponse(Job job) {
-        long completedTasks = job.getTasks().stream()
-                .filter(t -> t.getStatus() == TaskStatus.SUCCESS).count();
+    private JobSummaryResponse toSummaryResponse(Job job, TaskRepository.JobTaskCounts counts) {
         return JobSummaryResponse.builder()
                 .jobId(job.getId())
                 .name(job.getName())
                 .status(job.getStatus())
-                .taskCount(job.getTasks().size())
-                .completedTasks((int) completedTasks)
+                .taskCount(counts == null ? 0 : (int) counts.getTotal())
+                .completedTasks(counts == null ? 0 : (int) counts.getCompleted())
                 .createdAt(job.getCreatedAt())
                 .completedAt(job.getCompletedAt())
                 .build();
@@ -154,6 +153,8 @@ public class JobService {
             .status(task.getStatus())
             .workerId(task.getWorkerId())
             .retryCount(task.getRetryCount())
+            .maxRetries(task.getMaxRetries())
+            .timeoutSeconds(task.getTimeoutSeconds())
             .startedAt(task.getStartedAt())
             .completedAt(task.getCompletedAt())
             .dependencies(task.getDependencies().stream().map(Task::getId).toList())
@@ -175,20 +176,10 @@ public class JobService {
             }
 
             boolean allSuccess = tasks.stream().allMatch(t -> t.getStatus() == TaskStatus.SUCCESS);
-            boolean anyFailed = tasks.stream().anyMatch(t -> 
-                t.getStatus() == TaskStatus.FAILED || 
-                t.getStatus() == TaskStatus.TIMED_OUT ||
-                t.getStatus() == TaskStatus.CANCELLED
-            );
+            boolean anySuccess = tasks.stream().anyMatch(t -> t.getStatus() == TaskStatus.SUCCESS);
 
-            JobStatus finalStatus;
-            if (allSuccess) {
-                finalStatus = JobStatus.SUCCESS;
-            } else if (anyFailed) {
-                finalStatus = JobStatus.FAILED;
-            } else {
-                finalStatus = JobStatus.CANCELLED;
-            }
+            JobStatus finalStatus = allSuccess ? JobStatus.SUCCESS
+                    : (anySuccess ? JobStatus.PARTIALLY_FAILED : JobStatus.FAILED);
 
             job.setStatus(finalStatus);
             job.setCompletedAt(Instant.now());

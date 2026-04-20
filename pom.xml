@@ -24,7 +24,7 @@
     </modules>
 
     <properties>
-        <java.version>23</java.version>
+        <java.version>21</java.version>
         <dtoe.version>1.0.0-SNAPSHOT</dtoe.version>
     </properties>
 

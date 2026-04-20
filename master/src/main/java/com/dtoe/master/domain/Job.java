@@ -3,7 +3,6 @@ package com.dtoe.master.domain;
 import com.dtoe.shared.enums.JobStatus;
 import jakarta.persistence.*;
 import lombok.*;
-import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.Instant;
@@ -34,7 +33,6 @@ public class Job {
 
     private String submittedBy;
 
-    @CreationTimestamp
     private Instant createdAt;
 
     @UpdateTimestamp
@@ -49,6 +47,14 @@ public class Job {
     public boolean isTerminal() {
         return status == JobStatus.SUCCESS
                 || status == JobStatus.FAILED
+                || status == JobStatus.PARTIALLY_FAILED
                 || status == JobStatus.CANCELLED;
+    }
+
+    @PrePersist
+    protected void onCreate() {
+        if (createdAt == null) {
+            createdAt = Instant.now();
+        }
     }
 }
