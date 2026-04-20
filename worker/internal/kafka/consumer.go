@@ -18,23 +18,28 @@ import (
 )
 
 type Consumer struct {
-	reader       *kafka.Reader
-	resultWriter *kafka.Writer
-	executor     *executor.TaskExecutor
-	heartbeat    *heartbeat.Service
-	dbPool       *pgxpool.Pool
-	workerID     string
-	activeTasks  int32
-	logger       *gozap.SugaredLogger
+	reader         *kafka.Reader
+	resultWriter   *kafka.Writer
+	executor       *executor.TaskExecutor
+	heartbeat      *heartbeat.Service
+	workerSlots    chan struct{}
+	dbPool         *pgxpool.Pool
+	workerID       string
+	activeTasks    int32
+	logger         *gozap.SugaredLogger
+	taskBaseCtx    context.Context
+	taskBaseCancel context.CancelFunc
 }
 
 func NewConsumer(cfg *config.Config, logger *gozap.SugaredLogger) (*Consumer, error) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  cfg.Kafka.Brokers,
-		Topic:    cfg.Kafka.TaskQueueTopic,
-		GroupID:  cfg.Kafka.ConsumerGroup,
-		MinBytes: 1e3,
-		MaxBytes: 10e6,
+		Brokers:        cfg.Kafka.Brokers,
+		Topic:          cfg.Kafka.TaskQueueTopic,
+		GroupID:        cfg.Kafka.ConsumerGroup,
+		MinBytes:       1,
+		MaxBytes:       10e6,
+		MaxWait:        1 * time.Second,
+		CommitInterval: 0, // commit explicitly, after the task row is claimed
 	})
 
 	resultWriter := &kafka.Writer{
@@ -55,22 +60,24 @@ func NewConsumer(cfg *config.Config, logger *gozap.SugaredLogger) (*Consumer, er
 		return nil, err
 	}
 
-	hb, err := heartbeat.NewService(connString, workerID, func() int {
-		return cfg.Worker.ThreadPoolSize
-	}, cfg.Worker.ThreadPoolSize)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Consumer{
+	consumer := &Consumer{
 		reader:       reader,
 		resultWriter: resultWriter,
 		executor:     executor.NewTaskExecutor(),
-		heartbeat:    hb,
+		workerSlots:  make(chan struct{}, cfg.Worker.ThreadPoolSize),
 		dbPool:       pool,
 		workerID:     workerID,
 		logger:       logger,
-	}, nil
+	}
+	consumer.taskBaseCtx, consumer.taskBaseCancel = context.WithCancel(context.Background())
+
+	hb := heartbeat.NewService(pool, workerID, func() int {
+		return int(consumer.GetActiveTasks())
+	}, cfg.Worker.ThreadPoolSize)
+
+	consumer.heartbeat = hb
+
+	return consumer, nil
 }
 
 func buildConnString(cfg *config.DatabaseConfig) string {
@@ -78,80 +85,113 @@ func buildConnString(cfg *config.DatabaseConfig) string {
 }
 
 func (c *Consumer) Close() error {
-	c.heartbeat.Close()
+	c.taskBaseCancel()
+	readErr := c.reader.Close()
+	writeErr := c.resultWriter.Close()
 	c.dbPool.Close()
-	if err := c.reader.Close(); err != nil {
-		return err
+	if readErr != nil {
+		return readErr
 	}
-	return c.resultWriter.Close()
+	return writeErr
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
+	c.logger.Infow("Starting consumer", "topic", c.reader.Config().Topic, "groupID", c.reader.Config().GroupID)
 	for {
 		select {
 		case <-ctx.Done():
+			c.logger.Info("Consumer context cancelled")
 			return nil
 		default:
-			msg, err := c.reader.ReadMessage(ctx)
+			c.logger.Debug("Waiting for message...")
+			msg, err := c.reader.FetchMessage(ctx)
 			if err != nil {
-				c.logger.Errorw("Failed to read message", "error", err)
+				if ctx.Err() != nil {
+					c.logger.Info("Consumer context cancelled while reading from Kafka")
+					return nil
+				}
+				c.logger.Errorw("Failed to fetch message", "error", err)
 				metrics.KafkaConsumeErrors.Inc()
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
+			c.logger.Infow("Received message", "partition", msg.Partition, "offset", msg.Offset, "key", string(msg.Key), "size", len(msg.Value))
 			metrics.KafkaMessagesProcessed.Inc()
 
 			taskMsg, err := messaging.ParseTaskMessage(msg.Value)
 			if err != nil {
-				c.logger.Errorw("Failed to parse task message", "error", err)
+				c.logger.Errorw("Failed to parse task message", "error", err, "rawMessage", string(msg.Value))
 				metrics.KafkaProcessingErrors.Inc()
+				c.commit(ctx, msg)
 				continue
 			}
 
+			taskUUID, err := uuid.Parse(taskMsg.TaskID)
+			if err != nil {
+				c.logger.Errorw("Invalid task ID", "taskId", taskMsg.TaskID, "error", err)
+				metrics.KafkaProcessingErrors.Inc()
+				c.commit(ctx, msg)
+				continue
+			}
+
+			c.logger.Infow("Parsed task message", "taskId", taskMsg.TaskID, "jobId", taskMsg.JobID, "type", taskMsg.Type)
+
+			claimed, err := c.claimTask(ctx, taskUUID)
+			if err != nil {
+				// The task row was not claimed, so the message must be redelivered.
+				c.logger.Errorw("Failed to claim task", "taskId", taskMsg.TaskID, "error", err)
+				metrics.KafkaConsumeErrors.Inc()
+				time.Sleep(time.Second)
+				continue
+			}
+			if !claimed {
+				c.logger.Debugw("Task is no longer QUEUED, discarding message", "taskId", taskMsg.TaskID)
+				c.commit(ctx, msg)
+				continue
+			}
+
+			// From here the DB row owns the task: on a crash it stays RUNNING and
+			// the scheduler's timeout check recovers it.
+			c.commit(ctx, msg)
+
+			select {
+			case c.workerSlots <- struct{}{}:
+			case <-ctx.Done():
+				c.logger.Info("Consumer context cancelled before scheduling task")
+				return nil
+			}
+
 			atomic.AddInt32(&c.activeTasks, 1)
-			go c.processTask(ctx, taskMsg)
+			go c.processTask(c.taskBaseCtx, taskMsg, taskUUID)
 		}
 	}
 }
 
-func (c *Consumer) processTask(ctx context.Context, msg *messaging.TaskMessage) {
-	defer atomic.AddInt32(&c.activeTasks, -1)
+func (c *Consumer) commit(ctx context.Context, msg kafka.Message) {
+	if err := c.reader.CommitMessages(ctx, msg); err != nil {
+		c.logger.Errorw("Failed to commit offset", "partition", msg.Partition, "offset", msg.Offset, "error", err)
+	}
+}
+
+func (c *Consumer) processTask(ctx context.Context, msg *messaging.TaskMessage, taskUUID uuid.UUID) {
+	defer func() {
+		<-c.workerSlots
+		atomic.AddInt32(&c.activeTasks, -1)
+	}()
 	metrics.RecordTaskStart()
 
-	taskUUID, err := uuid.Parse(msg.TaskID)
-	if err != nil {
-		c.logger.Errorw("Invalid task ID", "taskId", msg.TaskID, "error", err)
-		metrics.RecordTaskEnd()
-		return
-	}
+	c.logger.Infow("Processing task", "taskId", msg.TaskID, "jobId", msg.JobID, "type", msg.Type)
 
 	c.insertTaskLog(ctx, taskUUID, "INFO", "Task received by worker "+c.workerID)
-
-	acquired, err := c.tryAcquireLock(ctx, taskUUID)
-	if err != nil {
-		c.logger.Errorw("Failed to acquire lock", "taskId", msg.TaskID, "error", err)
-		c.insertTaskLog(ctx, taskUUID, "ERROR", "Failed to acquire lock: "+err.Error())
-		metrics.RecordTaskEnd()
-		return
-	}
-	if !acquired {
-		c.logger.Debugw("Task already being processed by another worker", "taskId", msg.TaskID)
-		metrics.RecordTaskEnd()
-		return
-	}
-	defer c.releaseLock(ctx, taskUUID)
-
-	if err := c.setTaskRunning(ctx, taskUUID); err != nil {
-		c.logger.Errorw("Failed to set task running", "taskId", msg.TaskID, "error", err)
-		c.insertTaskLog(ctx, taskUUID, "ERROR", "Failed to set task running: "+err.Error())
-		metrics.RecordTaskEnd()
-		return
-	}
 
 	c.insertTaskLog(ctx, taskUUID, "INFO", fmt.Sprintf("Task started (type=%s, timeout=%ds, retry=%d/%d)",
 		msg.Type, msg.TimeoutSeconds, msg.RetryCount, msg.MaxRetries))
 
+	c.logger.Infow("Executing task", "taskId", msg.TaskID, "type", msg.Type)
 	result := c.executor.Execute(ctx, msg)
+
+	c.logger.Infow("Task execution completed", "taskId", msg.TaskID, "status", result.Status, "duration", result.CompletedAt.Sub(result.StartedAt).String())
 
 	resultMsg := messaging.TaskResultMessage{
 		TaskID:       msg.TaskID,
@@ -160,8 +200,8 @@ func (c *Consumer) processTask(ctx context.Context, msg *messaging.TaskMessage) 
 		Status:       result.Status,
 		Output:       result.Output,
 		ErrorMessage: result.Error,
-		StartedAt:    result.StartedAt,
-		CompletedAt:  result.CompletedAt,
+		StartedAt:    messaging.CustomTime{Time: result.StartedAt},
+		CompletedAt:  messaging.CustomTime{Time: result.CompletedAt},
 	}
 
 	if result.Status == messaging.TaskStatusSuccess {
@@ -179,40 +219,30 @@ func (c *Consumer) processTask(ctx context.Context, msg *messaging.TaskMessage) 
 		return
 	}
 
+	c.logger.Infow("Sending result message", "taskId", msg.TaskID, "status", result.Status)
 	if err := c.resultWriter.WriteMessages(ctx, kafka.Message{
 		Key:   []byte(msg.JobID),
 		Value: data,
 	}); err != nil {
 		c.logger.Errorw("Failed to write result message", "error", err)
 	}
+
+	c.logger.Infow("Task processing complete", "taskId", msg.TaskID)
 }
 
-func (c *Consumer) tryAcquireLock(ctx context.Context, taskID uuid.UUID) (bool, error) {
-	lockKey := int64(taskID.ID())
-	if lockKey < 0 {
-		lockKey = -lockKey
+// claimTask moves the task QUEUED -> RUNNING only if it is still QUEUED.
+// Returns false when another worker already claimed it, or when the task was
+// cancelled/finished while the message sat in the topic.
+func (c *Consumer) claimTask(ctx context.Context, taskID uuid.UUID) (bool, error) {
+	tag, err := c.dbPool.Exec(ctx, `
+		UPDATE tasks
+		   SET status = 'RUNNING', started_at = NOW(), completed_at = NULL,
+		       error_message = NULL, worker_id = $1, updated_at = NOW()
+		 WHERE id = $2 AND status = 'QUEUED'`, c.workerID, taskID)
+	if err != nil {
+		return false, err
 	}
-
-	var acquired bool
-	err := c.dbPool.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired)
-	return acquired, err
-}
-
-func (c *Consumer) releaseLock(ctx context.Context, taskID uuid.UUID) error {
-	lockKey := int64(taskID.ID())
-	if lockKey < 0 {
-		lockKey = -lockKey
-	}
-	_, err := c.dbPool.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
-	return err
-}
-
-func (c *Consumer) setTaskRunning(ctx context.Context, taskID uuid.UUID) error {
-	_, err := c.dbPool.Exec(ctx,
-		"UPDATE tasks SET status = 'RUNNING', started_at = NOW(), worker_id = $1, updated_at = NOW() WHERE id = $2",
-		c.workerID, taskID,
-	)
-	return err
+	return tag.RowsAffected() == 1, nil
 }
 
 func (c *Consumer) insertTaskLog(ctx context.Context, taskID uuid.UUID, level, message string) {
@@ -222,7 +252,9 @@ func (c *Consumer) insertTaskLog(ctx context.Context, taskID uuid.UUID, level, m
 	)
 	if err != nil {
 		c.logger.Debugw("Failed to insert task log", "taskId", taskID, "error", err)
+		return
 	}
+	metrics.TaskLogEntries.Inc()
 }
 
 func (c *Consumer) SendHeartbeat(ctx context.Context) error {
@@ -240,6 +272,11 @@ func (c *Consumer) GetActiveTasks() int32 {
 func (c *Consumer) WaitForCompletion(ctx context.Context, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
 		if atomic.LoadInt32(&c.activeTasks) == 0 {
 			return true
 		}

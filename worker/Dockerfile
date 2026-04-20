@@ -2,16 +2,23 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
-RUN go mod download
+ENV GOPROXY=https://proxy.golang.org,direct
 
-COPY . .
+COPY worker/go.mod worker/go.sum ./
+COPY go_shared /go_shared
+COPY worker ./
+RUN go mod download
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o worker ./cmd/worker
 
-FROM alpine:latest
+FROM debian:bookworm-slim
 
-RUN apk --no-cache add ca-certificates tzdata
+RUN apt-get update && apt-get install -y ca-certificates tzdata wget curl && \
+    wget -q https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -O packages-microsoft-prod.deb && \
+    dpkg -i packages-microsoft-prod.deb && \
+    apt-get update && \
+    apt-get install -y powershell && \
+    rm -rf /var/lib/apt/lists/* packages-microsoft-prod.deb
 
 WORKDIR /root/
 

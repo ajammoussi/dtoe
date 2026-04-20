@@ -1,51 +1,42 @@
 package heartbeat
 
 import (
-    "context"
-    "os"
+	"context"
+	"os"
 
-    "github.com/google/uuid"
-    "github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Service struct {
-    pool       *pgxpool.Pool
-    workerID   string
-    hostname   string
-    getActiveTasks func() int
-    capacity   int
+	pool           *pgxpool.Pool
+	workerID       string
+	hostname       string
+	getActiveTasks func() int
+	capacity       int
 }
 
-func NewService(connString, workerID string, getActiveTasks func() int, capacity int) (*Service, error) {
-    pool, err := pgxpool.New(context.Background(), connString)
-    if err != nil {
-        return nil, err
-    }
+func NewService(pool *pgxpool.Pool, workerID string, getActiveTasks func() int, capacity int) *Service {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
 
-    hostname, _ := os.Hostname()
-    if hostname == "" {
-        hostname = "unknown"
-    }
+	if workerID == "" {
+		workerID = "worker-" + uuid.New().String()[:8]
+	}
 
-    if workerID == "" {
-        workerID = "worker-" + uuid.New().String()[:8]
-    }
-
-    return &Service{
-        pool:         pool,
-        workerID:     workerID,
-        hostname:     hostname,
-        getActiveTasks: getActiveTasks,
-        capacity:     capacity,
-    }, nil
-}
-
-func (s *Service) Close() {
-    s.pool.Close()
+	return &Service{
+		pool:           pool,
+		workerID:       workerID,
+		hostname:       hostname,
+		getActiveTasks: getActiveTasks,
+		capacity:       capacity,
+	}
 }
 
 func (s *Service) SendHeartbeat(ctx context.Context) error {
-    query := `
+	query := `
         INSERT INTO worker_heartbeats (worker_id, hostname, active_tasks, capacity, last_seen_at, started_at)
         VALUES ($1, $2, $3, $4, NOW(), NOW())
         ON CONFLICT (worker_id) DO UPDATE SET
@@ -55,10 +46,10 @@ func (s *Service) SendHeartbeat(ctx context.Context) error {
             last_seen_at = NOW()
     `
 
-    _, err := s.pool.Exec(ctx, query, s.workerID, s.hostname, s.getActiveTasks(), s.capacity)
-    return err
+	_, err := s.pool.Exec(ctx, query, s.workerID, s.hostname, s.getActiveTasks(), s.capacity)
+	return err
 }
 
 func (s *Service) GetWorkerID() string {
-    return s.workerID
+	return s.workerID
 }

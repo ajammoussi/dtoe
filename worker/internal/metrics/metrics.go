@@ -47,26 +47,26 @@ var (
 		},
 	)
 
-KafkaMessagesProcessed = promauto.NewCounter(
-	prometheus.CounterOpts{
-		Name: "dtoe_worker_kafka_messages_processed_total",
-		Help: "Total number of Kafka messages processed",
-	},
-)
+	KafkaMessagesProcessed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dtoe_worker_kafka_messages_processed_total",
+			Help: "Total number of Kafka messages processed",
+		},
+	)
 
-KafkaConsumeErrors = promauto.NewCounter(
-	prometheus.CounterOpts{
-		Name: "dtoe_worker_kafka_consume_errors_total",
-		Help: "Total number of Kafka message consumption errors",
-	},
-)
+	KafkaConsumeErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dtoe_worker_kafka_consume_errors_total",
+			Help: "Total number of Kafka message consumption errors",
+		},
+	)
 
-KafkaProcessingErrors = promauto.NewCounter(
-	prometheus.CounterOpts{
-		Name: "dtoe_worker_kafka_processing_errors_total",
-		Help: "Total number of Kafka message processing errors",
-	},
-)
+	KafkaProcessingErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dtoe_worker_kafka_processing_errors_total",
+			Help: "Total number of Kafka message processing errors",
+		},
+	)
 
 	TaskLogEntries = promauto.NewCounter(
 		prometheus.CounterOpts{

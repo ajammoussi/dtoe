@@ -11,6 +11,7 @@ import (
 
 	"github.com/dtoe/worker/internal/config"
 	"github.com/dtoe/worker/internal/kafka"
+	"github.com/dtoe/worker/internal/metrics"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	gozap "go.uber.org/zap"
 )
@@ -54,7 +55,10 @@ func main() {
 			select {
 			case <-heartbeatTicker.C:
 				if err := consumer.SendHeartbeat(ctx); err != nil {
+					metrics.HeartbeatErrors.Inc()
 					sugar.Errorw("Failed to send heartbeat", "error", err)
+				} else {
+					metrics.HeartbeatSentTotal.Inc()
 				}
 			case <-ctx.Done():
 				return
@@ -94,7 +98,7 @@ func main() {
 
 	consumerCancel()
 
-	if ok := consumer.WaitForCompletion(ctx, 60*time.Second); !ok {
+	if ok := consumer.WaitForCompletion(context.Background(), 60*time.Second); !ok {
 		sugar.Warn("Timeout waiting for in-flight tasks to complete")
 	} else {
 		sugar.Info("All in-flight tasks completed")
