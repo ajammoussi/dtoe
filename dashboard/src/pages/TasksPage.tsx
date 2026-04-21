@@ -1,18 +1,23 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../api/api';
 import type { Task } from '../types';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
 
 export default function TasksPage() {
+  const navigate = useNavigate();
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [totalTasks, setTotalTasks] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.jobs.list()
-      .then(jobs => Promise.all(jobs.map(j => api.jobs.getTasks(j.id))).then(taskArrays => taskArrays.flat()))
-      .then(setTasks)
+    api.tasks.list({ size: 100 })
+      .then(res => {
+        setTasks(res.content);
+        setTotalTasks(res.totalElements);
+      })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
@@ -47,7 +52,10 @@ export default function TasksPage() {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-bold">Tasks</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-bold">Tasks</h2>
+        <p className="text-sm text-muted-foreground">{totalTasks} task(s) total</p>
+      </div>
 
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         {['PENDING', 'QUEUED', 'RUNNING', 'SUCCESS', 'FAILED', 'TIMED_OUT', 'RETRYING'].map(status => (
@@ -92,26 +100,26 @@ export default function TasksPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {tasks.map(task => (
-                    <tr key={task.id} className="border-b border-border/50 hover:bg-accent/5">
-                      <td className="py-3 px-4 font-mono text-xs">{task.id.slice(0, 8)}...</td>
-                      <td className="py-3 px-4 font-mono text-xs">{task.jobId.slice(0, 8)}...</td>
-                      <td className="py-3 px-4">
-                        <span className="px-2 py-1 rounded-md bg-violet-500/20 text-violet-400 text-xs font-medium">
-                          {task.type}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4">
-                        <Badge status={task.status} />
-                      </td>
-                      <td className="py-3 px-4 text-sm">
-                        {task.retryCount}/{task.maxRetries}
-                      </td>
-                      <td className="py-3 px-4 font-mono text-xs text-muted-foreground">
-                        {task.workerId || '-'}
-                      </td>
-                    </tr>
-                  ))}
+                   {tasks.map(task => (
+                     <tr key={task.id} className="border-b border-border/50 hover:bg-accent/5 cursor-pointer" onClick={() => navigate(`/tasks/${task.id}`)}>
+                       <td className="py-3 px-4 font-mono text-xs hover:text-primary">{task.id.slice(0, 8)}...</td>
+                       <td className="py-3 px-4 font-mono text-xs">{task.jobId ? `${task.jobId.slice(0, 8)}...` : '-'}</td>
+                       <td className="py-3 px-4">
+                         <span className="px-2 py-1 rounded-md bg-violet-500/20 text-violet-400 text-xs font-medium">
+                           {task.type}
+                         </span>
+                       </td>
+                       <td className="py-3 px-4">
+                         <Badge status={task.status} />
+                       </td>
+                       <td className="py-3 px-4 text-sm">
+                         {task.retryCount}/{task.maxRetries}
+                       </td>
+                       <td className="py-3 px-4 font-mono text-xs text-muted-foreground">
+                         {task.workerId || '-'}
+                       </td>
+                     </tr>
+                   ))}
                 </tbody>
               </table>
             </div>

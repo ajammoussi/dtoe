@@ -6,7 +6,7 @@ interface BadgeProps {
 }
 
 export function Badge({ status, className }: BadgeProps) {
-  const isWorker = status === 'IDLE' || status === 'BUSY' || status === 'DEAD';
+  const isWorker = status === 'HEALTHY' || status === 'STALE' || status === 'BUSY' || status === 'DEAD';
   const colors = isWorker ? getWorkerStatusColor(status) : getStatusColor(status);
 
   return (

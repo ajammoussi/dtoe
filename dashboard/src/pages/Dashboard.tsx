@@ -5,27 +5,42 @@ import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { Badge } from '../components/ui/badge';
 import { Skeleton } from '../components/ui/skeleton';
 
+const RECENT_JOBS_SAMPLE = 100;
+
 export default function Dashboard() {
   const [stats, setStats] = useState({ jobs: 0, tasks: 0, workers: 0, successRate: 0 });
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [workers, setWorkers] = useState<Worker[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const loadData = () => {
     Promise.all([
-      api.jobs.list(),
+      api.jobs.listPage({ size: RECENT_JOBS_SAMPLE }),
       api.workers.list(),
+      api.tasks.list({ size: 1 }),
     ])
-      .then(([jobs, workers]) => {
-        const totalJobs = jobs.length;
-        const successJobs = jobs.filter(j => j.status === 'SUCCESS').length;
+      .then(([jobsPage, workerList, tasksPage]) => {
+        setJobs(jobsPage.content);
+        setWorkers(workerList);
+
+        const sample = jobsPage.content;
+        const successJobs = sample.filter(j => j.status === 'SUCCESS').length;
+        const activeWorkers = workerList.filter(w => w.status === 'HEALTHY' || w.status === 'BUSY').length;
         setStats({
-          jobs: totalJobs,
-          tasks: 0,
-          workers: workers.length,
-          successRate: totalJobs > 0 ? Math.round((successJobs / totalJobs) * 100) : 0,
+          jobs: jobsPage.totalElements,
+          tasks: tasksPage.totalElements,
+          workers: activeWorkers,
+          successRate: sample.length > 0 ? Math.round((successJobs / sample.length) * 100) : 0,
         });
       })
       .catch(console.error)
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   if (loading) {
@@ -65,7 +80,7 @@ export default function Dashboard() {
       borderColor: 'border-violet-500/30',
     },
     {
-      title: 'Success Rate',
+      title: 'Success Rate (last 100 jobs)',
       value: `${stats.successRate}%`,
       icon: '✅',
       color: 'from-cyan-500 to-cyan-600',
@@ -108,7 +123,7 @@ export default function Dashboard() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <RecentJobsList />
+            <RecentJobsList jobs={jobs} />
           </CardContent>
         </Card>
 
@@ -119,7 +134,7 @@ export default function Dashboard() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ActiveWorkersList />
+            <ActiveWorkersList workers={workers} />
           </CardContent>
         </Card>
       </div>
@@ -127,22 +142,14 @@ export default function Dashboard() {
   );
 }
 
-function RecentJobsList() {
-  const [jobs, setJobs] = useState<Job[]>([]);
-
-  useEffect(() => {
-    api.jobs.list()
-      .then(setJobs)
-      .catch(console.error);
-  }, []);
-
+function RecentJobsList({ jobs }: { jobs: Job[] }) {
   if (jobs.length === 0) {
     return <p className="text-muted-foreground text-center py-4">No jobs yet</p>;
   }
 
   return (
     <div className="space-y-3">
-          {jobs.slice(0, 5).map(job => (
+      {jobs.slice(0, 5).map(job => (
         <div key={job.id} className="flex items-center justify-between p-3 rounded-lg bg-background/50 border border-border">
           <div>
             <p className="font-medium">{job.name}</p>
@@ -150,34 +157,27 @@ function RecentJobsList() {
               {new Date(job.createdAt).toLocaleTimeString()}
             </p>
           </div>
-              <Badge status={job.status} />
+          <Badge status={job.status} />
         </div>
       ))}
     </div>
   );
 }
 
-function ActiveWorkersList() {
-  const [workers, setWorkers] = useState<Worker[]>([]);
-
-  useEffect(() => {
-    api.workers.list()
-      .then(setWorkers)
-      .catch(console.error);
-  }, []);
-
+function ActiveWorkersList({ workers }: { workers: Worker[] }) {
   if (workers.length === 0) {
     return <p className="text-muted-foreground text-center py-4">No workers online</p>;
   }
 
   return (
     <div className="space-y-3">
-          {workers.map(worker => (
+      {workers.map(worker => (
         <div key={worker.id} className="flex items-center justify-between p-3 rounded-lg bg-background/50 border border-border">
           <div className="flex items-center gap-3">
             <div className={`w-3 h-3 rounded-full ${
-              worker.status === 'IDLE' ? 'bg-emerald-500' :
-              worker.status === 'BUSY' ? 'bg-blue-500' : 'bg-red-500'
+              worker.status === 'HEALTHY' ? 'bg-emerald-500' :
+              worker.status === 'BUSY' ? 'bg-blue-500' :
+              worker.status === 'STALE' ? 'bg-amber-500' : 'bg-red-500'
             } animate-pulse`} />
             <div>
               <p className="font-medium font-mono text-sm">{worker.id.slice(0, 12)}...</p>
