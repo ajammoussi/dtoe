@@ -41,6 +41,7 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_NUM_PARTITIONS: 12
@@ -84,7 +85,6 @@ services:
       SPRING_DATASOURCE_USERNAME: dtoe
       SPRING_DATASOURCE_PASSWORD: dtoe
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9093
-      DTOE_KAFKA_TOPICS_TASK_QUEUE: task-queue
       DTOE_KAFKA_TOPICS_TASK_RESULTS: task-results
       DTOE_WORKER_DEAD_THRESHOLD_SECONDS: 60
     networks:
@@ -92,13 +92,15 @@ services:
 
   scheduler:
     build:
-      context: ./scheduler
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: scheduler/Dockerfile
     container_name: dtoe-scheduler
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      master:
         condition: service_healthy
     ports:
       - "8081:8081"
@@ -117,13 +119,15 @@ services:
 
   worker:
     build:
-      context: ./worker
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: worker/Dockerfile
     container_name: dtoe-worker
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      master:
         condition: service_healthy
     ports:
       - "8082:8082"
