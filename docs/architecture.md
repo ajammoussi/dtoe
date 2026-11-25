@@ -20,8 +20,8 @@
 
 | Goal | How DTOE Achieves It |
 |---|---|
-| **At-least-once delivery** | Kafka consumer commits offset only after task ACK |
-| **No duplicate execution** | PostgreSQL advisory locks per task ID |
+| **At-least-once delivery** | Kafka offset is committed only after the task has been claimed |
+| **No duplicate execution** | Claiming is a conditional `QUEUED → RUNNING` update: a stale or duplicate message updates 0 rows and is dropped |
 | **Horizontal scale** | Stateless workers; add more to scale throughput |
 | **Fault isolation** | Worker crash doesn't affect master or other workers |
 | **Observable** | Every state transition is logged with timestamp + worker ID |
@@ -31,64 +31,13 @@
 
 ## 2. Component Overview
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ MASTER NODE (Java/Spring Boot)                                   │
-│                                                                  │
-│  ┌─────────────┐   ┌──────────────┐   ┌────────────────────┐    │
-│  │ REST API    │──▶│ Job Service  │──▶│ DAG Resolver       │    │
-│  │(Controllers)│   │ (Ingestion)  │   │(Topo Sort+Validate)│    │
-│  └─────────────┘   └──────────────┘   └────────┬───────────┘    │
-│                                                │                 │
-│  ┌─────────────────────────────────────────────▼──────────────┐ │
-│  │ Result Consumer                                             │ │
-│  │ - Reads from Kafka topic: task-results                      │ │
-│  │ - Updates task state (SUCCESS / FAILED)                     │ │
-│  │ - Triggers dependency resolution for downstream tasks       │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
+![DTOE architecture: client and dashboard, master, scheduler, workers, Kafka, PostgreSQL, Prometheus and Grafana](assets/architecture.png)
 
-┌──────────────────────────────────────────────────────────────────┐
-│ SCHEDULER SERVICE (Go)                                           │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ Scheduler                                                    │ │
-│  │ - Polls DB for READY tasks (dependencies all SUCCESS)       │ │
-│  │ - Publishes TaskMessage to Kafka topic: task-queue          │ │
-│  │ - Updates task status to QUEUED                             │ │
-│  │ - Monitors RUNNING tasks for timeout                        │ │
-│  │ - Enforces retry policy with exponential backoff            │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  Health: http://localhost:8081/health                            │
-└──────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────┐
-│ WORKER NODE (Go)                                                 │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ Kafka Consumer Group                                        │  │
-│  │ topic: task-queue (group: worker-group)                    │  │
-│  └─────────────────────────────┬──────────────────────────────┘  │
-│                                │                                  │
-│  ┌─────────────────────────────▼──────────────────────────────┐  │
-│  │ Task Executor Service                                       │  │
-│  │ - Goroutine pool (configurable size)                        │  │
-│  │ - Acquires PG advisory lock on task_id                      │  │
-│  │ - Runs TaskHandler (pluggable interface)                    │  │
-│  │ - Enforces timeout via context.WithTimeout                  │  │
-│  │ - Publishes result to task-results topic                    │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ Heartbeat Service                                           │  │
-│  │ - Writes to worker_heartbeats every 5s                     │  │
-│  │ - Includes: worker_id, host, active_tasks, capacity        │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  Health: http://localhost:8082/health                            │
-└──────────────────────────────────────────────────────────────────┘
-```
+- **Master (Java/Spring Boot)** — REST API, DAG validation, result consumer, worker registry. It never publishes work itself.
+- **Scheduler (Go)** — the sole writer of `task-queue`: promotes dependency-ready tasks, applies retry backoff, enforces timeouts, requeues stranded `QUEUED` rows.
+- **Workers (Go ×N)** — consume `task-queue`, claim each task with a conditional `QUEUED → RUNNING` update, execute it, publish to `task-results`, and heartbeat every 5s.
+- **PostgreSQL** — `jobs`, `tasks`, `task_dependencies`, `task_logs`, `worker_heartbeats`.
+- **Monitoring** — Prometheus scrapes all three services, Grafana renders the dashboards, and the React console polls the master API.
 
 ---
 
@@ -203,37 +152,42 @@ The scheduler is a standalone Go service that handles task promotion and timeout
 
 ### 5.1 Ready Task Promotion
 
-```go
-// Find tasks whose all dependencies are SUCCESS
-func (s *Scheduler) PromoteReadyTasks(ctx context.Context) error {
-    query := `
-        SELECT t.* FROM tasks t
-        WHERE t.status = 'PENDING'
-        AND NOT EXISTS (
-            SELECT 1 FROM task_dependencies td
-            JOIN tasks dep ON dep.id = td.dependency_id
-            WHERE td.task_id = t.id
-            AND dep.status != 'SUCCESS'
-        )
-        FOR UPDATE SKIP LOCKED
-    `
-    // Promote to QUEUED and publish to Kafka
-}
+Promotion and the status change happen in one statement, so any number of schedulers can run concurrently — each row is promoted exactly once:
+
+```sql
+WITH ready AS (
+    SELECT t.id FROM tasks t
+     WHERE t.status = 'PENDING'
+       AND NOT EXISTS (
+           SELECT 1 FROM task_dependencies td
+           JOIN tasks dep ON dep.id = td.dependency_id
+           WHERE td.task_id = t.id
+             AND dep.status != 'SUCCESS'
+       )
+     ORDER BY t.created_at
+     LIMIT $1
+     FOR UPDATE SKIP LOCKED
+)
+UPDATE tasks SET status = 'QUEUED', queued_at = NOW(), updated_at = NOW()
+ WHERE id IN (SELECT id FROM ready)
+RETURNING ...;
 ```
+
+- Due retries (`RETRYING` with `scheduled_for <= NOW()`) are claimed the same way.
+- The message is published **after** the claim; if the Kafka write fails, the row is reverted to `PENDING` (or `RETRYING`) so the task is not lost.
+- `QUEUED` rows older than five minutes are reverted to `PENDING` so a lost message cannot strand a task.
 
 ### 5.2 Timeout Enforcement
 
-```go
-func (s *Scheduler) EnforceTimeouts(ctx context.Context) error {
-    query := `
-        SELECT * FROM tasks
-        WHERE status = 'RUNNING'
-        AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second')
-        FOR UPDATE SKIP LOCKED
-    `
-    // Mark as TIMED_OUT and apply retry logic
-}
+Timeout enforcement reads `RUNNING` rows whose `started_at` is older than `(timeout_seconds + 30s grace)`, then either schedules a retry (`RETRYING` with `scheduled_for`) or marks the task `TIMED_OUT`:
+
+```sql
+SELECT ... FROM tasks
+ WHERE status = 'RUNNING'
+   AND started_at < NOW() - ((timeout_seconds + $1) * INTERVAL '1 second')
 ```
+
+The grace period lets a worker that is already finishing publish its own result before the scheduler reaps the task.
 
 ### 5.3 Configuration
 
@@ -256,22 +210,18 @@ Kafka Consumer receives TaskMessage
       ▼
 Consumer.processTask()
       │
-      ├── Acquire PostgreSQL advisory lock (pg_try_advisory_lock(task_id))
-      │     └── If lock fails → discard message (another worker has it)
+      ├── claimTask(): UPDATE ... WHERE id = $2 AND status = 'QUEUED'
+      │     └── 0 rows affected → discard the message
+      │           (already claimed, cancelled, or finished)
       │
-      ├── Update task status: RUNNING, set started_at, worker_id
-      │
-      ├── Resolve TaskHandler by task.type
+      ├── Insert task log, resolve TaskHandler by task.type
       │
       ├── Execute with timeout via context.WithTimeout
       │
-      ├── On SUCCESS:
-      │     - Publish TaskResultMessage to task-results
-      │     - Release advisory lock
+      ├── On SUCCESS / FAILED / TIMED_OUT:
+      │     └── Publish TaskResultMessage to task-results
       │
-      └── On FAILURE / TIMEOUT:
-            - Publish TaskResultMessage (status=FAILED)
-            - Release advisory lock
+      └── Commit the Kafka offset once the message is handled
 ```
 
 ### 6.2 TaskHandler Interface
@@ -432,45 +382,34 @@ CREATE INDEX idx_worker_heartbeats_last_seen ON worker_heartbeats(last_seen_at);
 
 ## 9. Concurrency & Locking Strategy
 
-### The Duplicate Execution Problem
+### The duplicate-delivery problem
 
-With multiple workers consuming the same Kafka topic, a message could theoretically be delivered to two workers simultaneously (e.g., during a consumer rebalance). Without a lock, the same task would execute twice.
+Kafka is at-least-once: during a rebalance the same message can be delivered twice, and a message can arrive for a task that was cancelled or already executed. DTOE does not use advisory locks; it relies on atomic state transitions, so exactly one consumer can act on a task.
 
-### Solution: PostgreSQL Advisory Locks
+### Worker claim
+
+`claimTask` issues a conditional update and inspects the affected row count:
 
 ```go
-func (c *Consumer) tryAcquireLock(ctx context.Context, taskID uuid.UUID) (bool, error) {
-    lockKey := int64(taskID.ID())
-    if lockKey < 0 {
-        lockKey = -lockKey
-    }
-
-    var acquired bool
-    err := c.dbPool.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired)
-    return acquired, err
-}
-
-func (c *Consumer) releaseLock(ctx context.Context, taskID uuid.UUID) error {
-    lockKey := int64(taskID.ID())
-    if lockKey < 0 {
-        lockKey = -lockKey
-    }
-    _, err := c.dbPool.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
-    return err
+tag, err := c.dbPool.Exec(ctx, `
+    UPDATE tasks
+       SET status = 'RUNNING', started_at = NOW(), completed_at = NULL,
+           error_message = NULL, worker_id = $1, updated_at = NOW()
+     WHERE id = $2 AND status = 'QUEUED'`, c.workerID, taskID)
+if tag.RowsAffected() != 1 {
+    // another worker owns it, or it was cancelled/reaped — drop the message
 }
 ```
 
-This ensures at-most-once execution per task at any given time, even across multiple worker instances.
+The Kafka offset is committed only after the claim succeeds, so a crash between fetch and claim leaves the message for redelivery.
 
-### Scheduler Locking
+### Scheduler promotion
 
-Only one scheduler instance should promote tasks at a time. We use a named advisory lock:
+`ClaimReadyTasks` / `ClaimRetryTasks` select and update inside one statement (`WITH ... FOR UPDATE SKIP LOCKED` + `UPDATE ... RETURNING`), so multiple schedulers can run safely: every row is promoted exactly once.
 
-```sql
-SELECT pg_try_advisory_lock(hashtext('dtoe-scheduler'));
-```
+### Result handling
 
-This allows running multiple scheduler instances for HA failover — only one actively schedules.
+The master accepts a result only while the task is `RUNNING`; a late result for a task the scheduler already reaped or retried cannot overwrite the newer state.
 
 ---
 
@@ -529,25 +468,20 @@ func (s *Scheduler) EnforceTimeouts(ctx context.Context) error {
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Web Dashboard
+### Web Console
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ DTOE DASHBOARD (Next.js/Vite) - Port 3000                        │
-│                                                                  │
-│ ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────────┐  │
-│ │   Jobs Panel    │ │  Tasks Panel    │ │   Workers Panel     │  │
-│ │   (Status,      │ │  (Status,       │ │   (Heartbeat,       │  │
-│ │    Counts)      │ │   Progress)     │ │    Active Tasks)    │  │
-│ └─────────────────┘ └─────────────────┘ └─────────────────────┘  │
-│                                                                  │
-│ Routes:                                                          │
-│   /       - Overview dashboard                                   │
-│   /jobs   - Jobs list with status                                │
-│   /tasks  - Tasks list across all jobs                           │
-│   /workers - Workers status and heartbeat info                   │
-└──────────────────────────────────────────────────────────────────┘
-```
+React 18 + TypeScript + Vite + Tailwind, served by nginx on port 3000. `/api` is proxied to the master; in development Vite proxies it to `localhost:8080`.
+
+| Route | Purpose |
+|---|---|
+| `/` | Cluster overview: totals, success rate, recent jobs, active workers |
+| `/jobs` | Search (`q`), status filter, page size and pagination held in the URL |
+| `/jobs/:jobId` | Summary, `Graph` / `Table` pipeline views, click-to-inspect step panel |
+| `/tasks` | Task search across name/type/job, status filter, pagination |
+| `/tasks/:taskId` | Definition (command + payload), error, output, logs, containing pipeline |
+| `/workers` | Active workers by default, opt-in inactive history |
+
+The DAG view is React Flow with a dagre layout: nodes are coloured by task status, edges by dependency, and selecting a node fills the inspector with its payload/command, timings, worker and error. The same component renders a live preview while a job is being created.
 
 ### Key Metrics
 
@@ -585,25 +519,29 @@ func (s *Scheduler) EnforceTimeouts(ctx context.Context) error {
 | Scheduler | `GET /metrics` | Tasks promoted, Kafka produced, poll duration |
 | Worker | `GET /metrics` | Tasks executed, task duration, heartbeat stats |
 
-### Dashboard Panels
+### Console Data Sources
 
-| Panel | Data Source | Refresh |
+| Panel | Endpoint | Refresh |
 |---|---|---|
-| Active Workers | `worker_heartbeats` | 5s |
-| Worker Capacity | `worker_heartbeats.active_tasks / capacity` | 5s |
-| Jobs in Flight | `jobs WHERE status = 'RUNNING'` | 5s |
-| Task Throughput | `tasks GROUP BY completed_at (1m buckets)` | 10s |
-| Error Rate | `tasks WHERE status = 'FAILED'` | 10s |
-| Task Log Tail | `task_logs ORDER BY logged_at DESC` | on-demand |
+| Overview counters (jobs, tasks, active workers, success rate) | `GET /jobs?size=100`, `GET /tasks?size=1`, `GET /workers` | 5s |
+| Job list (search, filter, paging) | `GET /jobs?q&status&page&size` | 5s |
+| Job pipeline (graph / table) | `GET /jobs/{id}` | 5s while `RUNNING` |
+| Task list (search, filter, paging) | `GET /tasks?q&status&page&size` | 5s |
+| Task detail + logs | `GET /tasks/{id}`, `GET /tasks/{id}/logs` | 5s while active |
+| Worker list (active, inactive) | `GET /workers` | 5s |
 
 ### Worker Health States
 
+`dead_threshold` defaults to 60s (`DTOE_WORKER_DEAD_THRESHOLD_SECONDS`); stale is a quarter of it.
+
 | State | Condition | Indicator |
 |---|---|---|
-| **HEALTHY** | Heartbeat within 60s, capacity > 0 | 🟢 Green |
-| **BUSY** | Active tasks = capacity | 🟡 Yellow |
-| **STALE** | Heartbeat 60–120s ago | 🟠 Orange |
-| **DEAD** | Heartbeat > 120s ago | 🔴 Red |
+| **HEALTHY** | Heartbeat < 15s old, free slots | 🟢 Green |
+| **BUSY** | Heartbeat fresh, `active_tasks >= capacity` | 🔵 Blue |
+| **STALE** | Heartbeat 15–60s old | 🟠 Amber |
+| **DEAD** | No heartbeat, or older than 60s | 🔴 Red |
+
+Worker IDs are generated per process, so restarts leave rows behind. The master's `WorkerHeartbeatCleanup` job deletes rows older than `dtoe.worker.retention-hours` (default 24h via `DTOE_WORKER_RETENTION_HOURS`, `0` disables) every 10 minutes; the console still hides inactive workers by default.
 
 ### Metrics (Master - Spring Actuator)
 

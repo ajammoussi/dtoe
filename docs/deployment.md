@@ -7,18 +7,18 @@ The fastest way to run the full stack locally.
 ### Prerequisites
 
 - Docker 24+ and Docker Compose v2
-- Go 1.22+ (for scheduler and worker)
-- Java 21+ (for master node)
-- Node.js 20+ (for the dashboard)
+- Go 1.23+ (workspace uses `go 1.23.0` for the scheduler and worker)
+- Java 21+ and Maven 3.9+ (master node)
+- Node.js 20+ (dashboard)
 
 ### Start Infrastructure
 
 ```bash
-# Start PostgreSQL, Kafka, Zookeeper, and Kafka UI
-docker-compose up -d
+# Infrastructure only — the services are run manually below
+docker compose up -d postgres zookeeper kafka kafka-ui
 
 # Verify all containers are healthy
-docker-compose ps
+docker compose ps
 ```
 
 Services started:
@@ -32,9 +32,11 @@ Services started:
 
 ### Run the Master Node (Java/Spring Boot)
 
+There is no Maven wrapper in this repository; use a local Maven 3.9+.
+
 ```bash
-cd master
-./mvnw spring-boot:run -Dspring-boot.run.profiles=local
+mvn -pl master -am -DskipTests package
+java -jar master/target/dtoe-master-1.0.0-SNAPSHOT.jar --spring.profiles.active=local
 ```
 
 The API will be available at `http://localhost:8080`.
@@ -94,7 +96,10 @@ Dashboard available at `http://localhost:3000`.
 | `SPRING_DATASOURCE_USERNAME` | `dtoe` | DB username |
 | `SPRING_DATASOURCE_PASSWORD` | `dtoe` | DB password |
 | `SPRING_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka bootstrap servers |
-| `DTOE_WORKER_DEAD_THRESHOLD_SECONDS` | `60` | Seconds before a worker is marked DEAD |
+| `DTOE_WORKER_DEAD_THRESHOLD_SECONDS` | `60` | Seconds before a worker is marked DEAD (STALE at a quarter of it) |
+| `DTOE_WORKER_RETENTION_HOURS` | `24` | Delete worker heartbeat rows older than this; `0` keeps history forever |
+| `DTOE_KAFKA_TOPICS_TASK_RESULTS` | `task-results` | Topic the master consumes results from |
+| `SERVER_PORT` | `8080` | HTTP port |
 
 ### Scheduler Service (Go)
 
@@ -106,6 +111,7 @@ Dashboard available at `http://localhost:3000`.
 | `DTOE_DATABASE_PASSWORD` | `dtoe` | DB password |
 | `DTOE_DATABASE_DATABASE` | `dtoe` | Database name |
 | `DTOE_KAFKA_BROKERS` | `localhost:9092` | Kafka bootstrap servers |
+| `DTOE_KAFKA_TASK_QUEUE_TOPIC` | `task-queue` | Topic the scheduler publishes to |
 | `DTOE_SCHEDULER_POLL_INTERVAL_MS` | `5000` | How often the scheduler polls for ready tasks |
 | `DTOE_SCHEDULER_TIMEOUT_CHECK_MS` | `10000` | How often timeout enforcement runs |
 
@@ -128,74 +134,28 @@ Dashboard available at `http://localhost:3000`.
 
 ### Dashboard
 
-| Variable | Default | Description |
-|---|---|---|
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8080` | Master node API base URL |
-| `NEXT_PUBLIC_REFRESH_INTERVAL` | `5000` | Dashboard polling interval in ms |
+The console has no runtime configuration: the browser calls the relative path `/api/v1/...`. In development Vite proxies that to `http://localhost:8080` (`vite.config.ts`), and in Docker nginx proxies it to `http://master:8080` (`nginx.conf`).
+
+Point it at a different master by editing the proxy target in one of those two files.
 
 ---
 
 ## Docker Compose File
 
-```yaml
-version: '3.8'
+[`docker-compose.yml`](../docker-compose.yml) is the source of truth — keep this guide descriptive rather than copying it, so the two cannot drift.
 
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: dtoe
-      POSTGRES_USER: dtoe
-      POSTGRES_PASSWORD: dtoe
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dtoe"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+| Service | Image / build | Ports |
+|---|---|---|
+| `postgres` | `postgres:16-alpine` | 5432 |
+| `zookeeper`, `kafka` | Confluent 7.6.1 | 2181, 9092 (host), 9093 (in-cluster) |
+| `kafka-ui` | `provectuslabs/kafka-ui` | 8090 |
+| `master` | `master/Dockerfile`, repo-root context | 8080 |
+| `scheduler` | `scheduler/Dockerfile`, repo-root context | 8081 |
+| `worker` | `worker/Dockerfile`, repo-root context | 8082 |
+| `dashboard` | `dashboard/Dockerfile` | 3000 |
+| `prometheus`, `grafana` | upstream images | 9090, 3001 |
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-    ports:
-      - "2181:2181"
-
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    depends_on:
-      - zookeeper
-    ports:
-      - "9092:9092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_NUM_PARTITIONS: 12
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
-    healthcheck:
-      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    depends_on:
-      - kafka
-    ports:
-      - "8090:8080"
-    environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-
-  volumes:
-    postgres_data:
-```
+Kafka advertises `kafka:9093` to the other containers and `localhost:9092` to the host. `master` waits for the Postgres and Kafka healthchecks before starting.
 
 ---
 
@@ -291,7 +251,7 @@ kind: Deployment
 metadata:
   name: dtoe-scheduler
 spec:
-  replicas: 2  # HA: only one actively schedules (advisory lock)
+  replicas: 2  # HA: promotion is atomic, both replicas can run
   selector:
     matchLabels:
       app: dtoe-scheduler
@@ -416,67 +376,19 @@ spec:
 
 ## Building Docker Images
 
-### Master Node (Java)
+All Dockerfiles expect the **repository root** as build context: `master/Dockerfile` copies `shared/` and `master/`, the Go ones copy `go_shared/` plus their module, and the console is built from `./dashboard`.
 
 ```bash
-cd master
-./mvnw package -DskipTests
-docker build -t your-registry/dtoe-master:latest .
+docker build -f master/Dockerfile    -t your-registry/dtoe-master:latest .
+docker build -f scheduler/Dockerfile -t your-registry/dtoe-scheduler:latest .
+docker build -f worker/Dockerfile    -t your-registry/dtoe-worker:latest .
+docker build -t your-registry/dtoe-dashboard:latest dashboard/
 ```
 
-### Scheduler (Go)
+Or let Compose do the same work:
 
 ```bash
-cd scheduler
-docker build -t your-registry/dtoe-scheduler:latest .
-```
-
-Dockerfile for scheduler:
-```dockerfile
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o scheduler ./cmd/scheduler
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /app/scheduler .
-EXPOSE 8081
-CMD ["./scheduler"]
-```
-
-### Worker (Go)
-
-```bash
-cd worker
-docker build -t your-registry/dtoe-worker:latest .
-```
-
-Dockerfile for worker:
-```dockerfile
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o worker ./cmd/worker
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /app/worker .
-EXPOSE 8082
-CMD ["./worker"]
-```
-
-### Dashboard
-
-```bash
-cd dashboard
-docker build -t your-registry/dtoe-dashboard:latest .
+docker compose build
 ```
 
 ### Push all images

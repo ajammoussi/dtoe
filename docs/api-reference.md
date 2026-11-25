@@ -89,9 +89,10 @@ Accepts a DAG definition and schedules it for execution. The server validates th
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `status` | string | (all) | Filter by job status |
+| `q` | string | (all) | Case-insensitive substring match on the job name |
 | `page` | int | 0 | Page number (0-indexed) |
 | `size` | int | 20 | Page size (max 100) |
-| `sort` | string | `createdAt,desc` | Sort field and direction |
+| `sort` | string | `createdAt,desc` | Sort field and direction; field must be one of `createdAt`, `updatedAt`, `name`, `status` |
 
 **Response** `200 OK`
 ```json
@@ -103,16 +104,19 @@ Accepts a DAG definition and schedules it for execution. The server validates th
       "status": "SUCCESS",
       "taskCount": 3,
       "completedTasks": 3,
+      "failedTasks": 0,
       "createdAt": "2024-01-15T10:00:00Z",
       "completedAt": "2024-01-15T10:04:32Z"
     }
   ],
   "totalElements": 47,
   "totalPages": 3,
-  "page": 0,
+  "number": 0,
   "size": 20
 }
 ```
+
+`completedTasks` counts `SUCCESS`; `failedTasks` counts `FAILED` + `TIMED_OUT`; both are computed per page in one query.
 
 ---
 
@@ -130,6 +134,7 @@ Returns full job details including all tasks and their current statuses.
   "status": "RUNNING",
   "submittedBy": "alice",
   "createdAt": "2024-01-15T10:00:00Z",
+  "completedAt": null,
   "tasks": [
     {
       "taskId": "a1b2c3d4-...",
@@ -138,8 +143,12 @@ Returns full job details including all tasks and their current statuses.
       "status": "SUCCESS",
       "workerId": "worker-abc123",
       "retryCount": 0,
+      "maxRetries": 3,
+      "timeoutSeconds": 60,
       "startedAt": "2024-01-15T10:00:01Z",
       "completedAt": "2024-01-15T10:00:14Z",
+      "errorMessage": null,
+      "payload": { "url": "https://internal-service/extract", "method": "POST" },
       "dependencies": []
     },
     {
@@ -149,13 +158,19 @@ Returns full job details including all tasks and their current statuses.
       "status": "RUNNING",
       "workerId": "worker-def456",
       "retryCount": 0,
+      "maxRetries": 2,
+      "timeoutSeconds": 120,
       "startedAt": "2024-01-15T10:00:15Z",
       "completedAt": null,
+      "errorMessage": null,
+      "payload": { "command": "/scripts/transform.sh" },
       "dependencies": ["a1b2c3d4-..."]
     }
   ]
 }
 ```
+
+`payload` carries the task definition (the shell command for `SHELL_COMMAND`), and `dependencies` are the **task UUIDs** of upstream tasks — this is what the console's DAG and step inspector render. `errorMessage` is populated for failed, timed-out and skipped (`CANCELLED`) tasks.
 
 ---
 
@@ -163,21 +178,68 @@ Returns full job details including all tasks and their current statuses.
 
 `DELETE /jobs/{jobId}`
 
-Cancels all PENDING and QUEUED tasks in the job. RUNNING tasks are allowed to finish.
+Cancels all `PENDING`, `QUEUED` and `RETRYING` tasks in the job and marks the job `CANCELLED`. Tasks already `RUNNING` are left to finish.
 
 **Response** `200 OK`
 ```json
 {
   "jobId": "3f7e8a10-...",
   "status": "CANCELLED",
-  "cancelledTasks": 2,
-  "message": "Job cancelled. 1 task(s) still running and will be allowed to complete."
+  "message": "Job cancelled successfully"
 }
 ```
+
+Already-terminal jobs return `409 Conflict`.
 
 ---
 
 ## Tasks
+
+### List Tasks
+
+`GET /tasks`
+
+Returns a page of task summaries across all jobs, newest first. The payload and output JSON are **not** included here — fetch `GET /tasks/{taskId}` for those.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `status` | string | (all) | Filter by task status |
+| `q` | string | (all) | Case-insensitive substring match on task name, task type or job name |
+| `page` | int | 0 | Page number (0-indexed) |
+| `size` | int | 50 | Page size (max 100) |
+
+**Response** `200 OK`
+```json
+{
+  "content": [
+    {
+      "taskId": "a1b2c3d4-...",
+      "jobId": "3f7e8a10-...",
+      "jobName": "nightly-etl-pipeline",
+      "name": "Extract from S3",
+      "type": "HTTP_REQUEST",
+      "status": "SUCCESS",
+      "retryCount": 0,
+      "maxRetries": 3,
+      "workerId": "worker-abc123",
+      "errorMessage": null,
+      "createdAt": "2024-01-15T10:00:00Z",
+      "startedAt": "2024-01-15T10:00:01Z",
+      "completedAt": "2024-01-15T10:00:14Z"
+    }
+  ],
+  "totalElements": 128,
+  "totalPages": 3,
+  "number": 0,
+  "size": 50
+}
+```
+
+The job is fetched with an entity graph, so a page costs two queries instead of N+1.
+
+---
 
 ### Get Task Details
 
@@ -188,6 +250,7 @@ Cancels all PENDING and QUEUED tasks in the job. RUNNING tasks are allowed to fi
 {
   "taskId": "a1b2c3d4-...",
   "jobId": "3f7e8a10-...",
+  "jobName": "nightly-etl-pipeline",
   "name": "Extract from S3",
   "type": "HTTP_REQUEST",
   "status": "FAILED",
@@ -198,9 +261,16 @@ Cancels all PENDING and QUEUED tasks in the job. RUNNING tasks are allowed to fi
   "errorMessage": "Connection refused: https://internal-service/extract",
   "createdAt": "2024-01-15T10:00:00Z",
   "startedAt": "2024-01-15T10:00:01Z",
-  "completedAt": "2024-01-15T10:01:45Z"
+  "completedAt": "2024-01-15T10:01:45Z",
+  "payload": {
+    "url": "https://internal-service/extract",
+    "method": "POST"
+  },
+  "output": null
 }
 ```
+
+`payload` is the task definition as submitted (for `SHELL_COMMAND` it contains `command`); `output` is whatever the executor returned.
 
 ---
 
@@ -208,36 +278,26 @@ Cancels all PENDING and QUEUED tasks in the job. RUNNING tasks are allowed to fi
 
 `GET /tasks/{taskId}/logs`
 
-Returns execution logs for a specific task, across all retry attempts.
-
-**Query Parameters**
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `level` | string | (all) | Filter: `INFO`, `WARN`, `ERROR` |
-| `limit` | int | 100 | Max log lines to return |
+Returns every log line written for the task (all retry attempts), oldest first. There is no server-side filtering or paging yet.
 
 **Response** `200 OK`
 ```json
 {
-  "taskId": "a1b2c3d4-...",
   "logs": [
     {
+      "id": 1,
+      "taskId": "a1b2c3d4-...",
       "level": "INFO",
-      "message": "Task started on worker worker-abc123",
+      "message": "Task received by worker worker-abc123",
       "loggedAt": "2024-01-15T10:00:01Z",
       "workerId": "worker-abc123"
     },
     {
+      "id": 2,
+      "taskId": "a1b2c3d4-...",
       "level": "ERROR",
-      "message": "Attempt 1/3 failed: Connection refused",
+      "message": "Connection refused",
       "loggedAt": "2024-01-15T10:00:06Z",
-      "workerId": "worker-abc123"
-    },
-    {
-      "level": "INFO",
-      "message": "Retrying in 2s (attempt 2/3)",
-      "loggedAt": "2024-01-15T10:00:08Z",
       "workerId": "worker-abc123"
     }
   ]
@@ -252,7 +312,7 @@ Returns execution logs for a specific task, across all retry attempts.
 
 `GET /workers`
 
-Returns all registered workers and their current health status.
+Returns every worker row still retained (24h by default) with its computed health status, sorted `HEALTHY`, `BUSY`, `STALE`, `DEAD`, then most recently seen first.
 
 **Response** `200 OK`
 ```json
@@ -279,11 +339,15 @@ Returns all registered workers and their current health status.
       "startedAt": "2024-01-15T09:00:15Z"
     }
   ],
+  "activeCount": 2,
+  "inactiveCount": 0,
   "totalCapacity": 16,
   "totalActiveTasks": 11,
   "clusterUtilizationPct": 68.75
 }
 ```
+
+`activeCount` counts `HEALTHY` + `BUSY`; `inactiveCount` is everything else. Capacity and utilisation are computed over **active** workers only, so a dead worker never inflates the cluster total. The console hides inactive rows by default and lets you reveal them.
 
 ---
 
@@ -299,18 +363,13 @@ Returns all registered workers and their current health status.
   "status": "HEALTHY",
   "activeTasks": 3,
   "capacity": 8,
+  "utilizationPct": 37.5,
   "lastSeenAt": "2024-01-15T10:05:00Z",
-  "startedAt": "2024-01-15T09:00:00Z",
-  "currentTasks": [
-    {
-      "taskId": "a1b2c3d4-...",
-      "jobName": "nightly-etl-pipeline",
-      "taskName": "Transform Data",
-      "startedAt": "2024-01-15T10:00:15Z"
-    }
-  ]
+  "startedAt": "2024-01-15T09:00:00Z"
 }
 ```
+
+Unknown worker IDs return `404 Not Found`.
 
 ---
 
@@ -338,15 +397,24 @@ Standard Spring Boot Actuator health endpoint. Returns status of all components.
 
 ### Metrics
 
-`GET /actuator/metrics/{metricName}`
+- Master: `GET /actuator/metrics/{metricName}` (Spring Actuator) and `GET /actuator/prometheus`.
+- Scheduler: `GET /metrics` on port 8081 (Prometheus text format).
+- Worker: `GET /metrics` on port 8082 (Prometheus text format).
 
-Available DTOE-specific metrics:
-
-| Metric | Description |
-|---|---|
-| `dtoe.tasks.queued` | Current count of tasks in QUEUED state |
-| `dtoe.tasks.running` | Current count of running tasks |
-| `dtoe.tasks.completed.total` | Total tasks completed (tagged by status) |
-| `dtoe.task.duration` | Task execution duration histogram |
-| `dtoe.worker.active_tasks` | Active tasks per worker |
-| `dtoe.scheduler.cycle.duration` | Time per scheduler cycle |
+| Metric | Service | Description |
+|---|---|---|
+| `dtoe_scheduler_tasks_promoted_total` | Scheduler | Tasks promoted `PENDING`/`RETRYING` → `QUEUED` |
+| `dtoe_task_retries_total` | Scheduler | Retries scheduled after a failure |
+| `dtoe_task_timeouts_total` | Scheduler | Tasks marked `TIMED_OUT` |
+| `dtoe_scheduler_poll_duration_seconds` | Scheduler | Poll loop duration histogram |
+| `dtoe_kafka_messages_produced_total` | Scheduler | Queue messages published |
+| `dtoe_kafka_produce_errors_total` | Scheduler | Failed publishes (task reverted) |
+| `dtoe_worker_tasks_executed_total` | Worker | Tasks completed, by type and status |
+| `dtoe_worker_task_execution_duration_seconds` | Worker | Execution duration histogram |
+| `dtoe_worker_tasks_in_flight` | Worker | Tasks currently executing |
+| `dtoe_worker_heartbeat_sent_total` | Worker | Heartbeats written |
+| `dtoe_worker_heartbeat_errors_total` | Worker | Failed heartbeat writes |
+| `dtoe_worker_task_log_entries_total` | Worker | Log lines inserted |
+| `dtoe_worker_kafka_messages_processed_total` | Worker | Messages consumed |
+| `dtoe_worker_kafka_consume_errors_total` | Worker | Consumer errors |
+| `dtoe_worker_kafka_processing_errors_total` | Worker | Message processing errors |

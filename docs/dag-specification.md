@@ -33,8 +33,10 @@ A **Job** in DTOE is a directed acyclic graph (DAG) of **Tasks**. Each task repr
 ### Field Notes
 
 - `id` is a **client-defined logical ID** used only within the job definition for expressing dependencies. The server assigns a separate UUID as the persistent task identifier.
-- `dependencies` is an array of `id` values from other tasks in the same job. An empty array means the task is a root node (runs immediately).
+- `dependencies` is an array of `id` values from other tasks in the same job. An empty array means the task is a root node (runs immediately). The alias `dependsOn` is accepted for the same field.
+- Duplicate ids and self-dependencies are rejected.
 - A job with no root tasks (every task has at least one dependency) is invalid and will be rejected.
+- The console renders the graph while you edit the form — the same DAG view used on the job page, with a click-to-inspect panel for payload, timeout and retries.
 
 ---
 
@@ -256,6 +258,8 @@ A → B → D
 A job submission will be rejected with `422 Unprocessable Entity` if any of the following are true:
 
 - The `tasks` array is empty
+- Two tasks share the same `id`
+- A task depends on itself
 - A task references a dependency `id` that doesn't exist in the job
 - The dependency graph contains a cycle
 - A task `type` is not registered on the server
