@@ -11,10 +11,12 @@ import com.dtoe.master.repository.JobRepository;
 import com.dtoe.master.repository.TaskRepository;
 import com.dtoe.shared.enums.JobStatus;
 import com.dtoe.shared.enums.TaskStatus;
+import jakarta.persistence.criteria.Predicate;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -26,6 +28,8 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class JobService {
+
+    private static final List<TaskStatus> FAILED_STATUSES = List.of(TaskStatus.FAILED, TaskStatus.TIMED_OUT);
 
     private final JobRepository jobRepository;
     private final TaskRepository taskRepository;
@@ -103,15 +107,24 @@ public class JobService {
     }
 
     @Transactional(readOnly = true)
-    public Page<JobSummaryResponse> listJobs(JobStatus status, Pageable pageable) {
-        Page<Job> jobs = status != null
-                ? jobRepository.findByStatus(status, pageable)
-                : jobRepository.findAll(pageable);
+    public Page<JobSummaryResponse> listJobs(JobStatus status, String search, Pageable pageable) {
+        Specification<Job> spec = (root, query, cb) -> {
+            List<Predicate> filters = new ArrayList<>();
+            if (status != null) {
+                filters.add(cb.equal(root.get("status"), status));
+            }
+            if (search != null && !search.isBlank()) {
+                filters.add(cb.greaterThan(
+                        cb.locate(cb.lower(root.get("name")), search.trim().toLowerCase()), 0));
+            }
+            return cb.and(filters.toArray(new Predicate[0]));
+        };
+        Page<Job> jobs = jobRepository.findAll(spec, pageable);
 
         List<UUID> jobIds = jobs.getContent().stream().map(Job::getId).toList();
         Map<UUID, TaskRepository.JobTaskCounts> counts = jobIds.isEmpty()
                 ? Map.of()
-                : taskRepository.countTasksByJobIds(jobIds, TaskStatus.SUCCESS).stream()
+                : taskRepository.countTasksByJobIds(jobIds, TaskStatus.SUCCESS, FAILED_STATUSES).stream()
                         .collect(Collectors.toMap(TaskRepository.JobTaskCounts::getJobId, c -> c));
 
         return jobs.map(job -> toSummaryResponse(job, counts.get(job.getId())));
@@ -129,6 +142,7 @@ public class JobService {
                 .status(job.getStatus())
                 .taskCount(counts == null ? 0 : (int) counts.getTotal())
                 .completedTasks(counts == null ? 0 : (int) counts.getCompleted())
+                .failedTasks(counts == null ? 0 : (int) counts.getFailed())
                 .createdAt(job.getCreatedAt())
                 .completedAt(job.getCompletedAt())
                 .build();
@@ -141,6 +155,7 @@ public class JobService {
                 .status(job.getStatus())
                 .submittedBy(job.getSubmittedBy())
                 .createdAt(job.getCreatedAt())
+                .completedAt(job.getCompletedAt())
                 .tasks(job.getTasks().stream().map(this::toTaskSummary).toList())
                 .build();
     }
@@ -157,6 +172,8 @@ public class JobService {
             .timeoutSeconds(task.getTimeoutSeconds())
             .startedAt(task.getStartedAt())
             .completedAt(task.getCompletedAt())
+            .errorMessage(task.getErrorMessage())
+            .payload(task.getPayload())
             .dependencies(task.getDependencies().stream().map(Task::getId).toList())
             .build();
     }

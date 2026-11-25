@@ -18,6 +18,7 @@ public class TaskDetailResponse {
 
     private UUID taskId;
     private UUID jobId;
+    private String jobName;
     private String name;
     private String type;
     private TaskStatus status;
@@ -29,5 +30,6 @@ public class TaskDetailResponse {
     private Instant createdAt;
     private Instant startedAt;
     private Instant completedAt;
+    private Map<String, Object> payload;
     private Map<String, Object> output;
 }

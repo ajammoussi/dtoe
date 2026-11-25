@@ -4,17 +4,26 @@ import com.dtoe.master.domain.WorkerHeartbeat;
 import com.dtoe.master.dto.response.WorkerListResponse;
 import com.dtoe.master.dto.response.WorkerResponse;
 import com.dtoe.master.repository.WorkerHeartbeatRepository;
+import com.dtoe.shared.enums.WorkerStatus;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/v1/workers")
 @RequiredArgsConstructor
 public class WorkerController {
+
+    private static final Map<WorkerStatus, Integer> STATUS_RANK = Map.of(
+            WorkerStatus.HEALTHY, 0,
+            WorkerStatus.BUSY, 1,
+            WorkerStatus.STALE, 2,
+            WorkerStatus.DEAD, 3);
 
     private final WorkerHeartbeatRepository workerHeartbeatRepository;
 
@@ -23,20 +32,28 @@ public class WorkerController {
 
     @GetMapping
     public ResponseEntity<WorkerListResponse> listWorkers() {
-        List<WorkerHeartbeat> workers = workerHeartbeatRepository.findAll();
-        
-        List<WorkerResponse> workerResponses = workers.stream()
+        List<WorkerResponse> all = workerHeartbeatRepository.findAll().stream()
                 .map(this::toResponse)
+                .sorted(Comparator
+                        .comparingInt((WorkerResponse w) -> STATUS_RANK.get(w.getStatus()))
+                        .thenComparing(WorkerResponse::getLastSeenAt,
+                                Comparator.nullsLast(Comparator.reverseOrder())))
                 .toList();
 
-        int totalCapacity = workers.stream().mapToInt(WorkerHeartbeat::getCapacity).sum();
-        int totalActiveTasks = workers.stream().mapToInt(WorkerHeartbeat::getActiveTasks).sum();
-        double clusterUtilization = totalCapacity > 0 
-                ? (double) totalActiveTasks / totalCapacity * 100 
+        List<WorkerResponse> active = all.stream()
+                .filter(w -> w.getStatus() == WorkerStatus.HEALTHY || w.getStatus() == WorkerStatus.BUSY)
+                .toList();
+
+        int totalCapacity = active.stream().mapToInt(WorkerResponse::getCapacity).sum();
+        int totalActiveTasks = active.stream().mapToInt(WorkerResponse::getActiveTasks).sum();
+        double clusterUtilization = totalCapacity > 0
+                ? (double) totalActiveTasks / totalCapacity * 100
                 : 0;
 
         return ResponseEntity.ok(WorkerListResponse.builder()
-                .workers(workerResponses)
+                .workers(all)
+                .activeCount(active.size())
+                .inactiveCount(all.size() - active.size())
                 .totalCapacity(totalCapacity)
                 .totalActiveTasks(totalActiveTasks)
                 .clusterUtilizationPct(clusterUtilization)

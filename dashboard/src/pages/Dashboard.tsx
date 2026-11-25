@@ -1,9 +1,12 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api/api';
 import type { Job, Worker } from '../types';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
 import { Skeleton } from '../components/ui/skeleton';
+import { usePolling } from '../lib/usePolling';
+import { formatRelative, shortId } from '../lib/format';
 
 const RECENT_JOBS_SAMPLE = 100;
 
@@ -13,19 +16,21 @@ export default function Dashboard() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const loadData = () => {
+  const loadData = useCallback(() => {
     Promise.all([
       api.jobs.listPage({ size: RECENT_JOBS_SAMPLE }),
       api.workers.list(),
       api.tasks.list({ size: 1 }),
     ])
-      .then(([jobsPage, workerList, tasksPage]) => {
+      .then(([jobsPage, workerData, tasksPage]) => {
         setJobs(jobsPage.content);
-        setWorkers(workerList);
+        setWorkers(workerData.workers);
 
         const sample = jobsPage.content;
         const successJobs = sample.filter(j => j.status === 'SUCCESS').length;
-        const activeWorkers = workerList.filter(w => w.status === 'HEALTHY' || w.status === 'BUSY').length;
+        const activeWorkers = workerData.workers.filter(
+          w => w.status === 'HEALTHY' || w.status === 'BUSY'
+        ).length;
         setStats({
           jobs: jobsPage.totalElements,
           tasks: tasksPage.totalElements,
@@ -35,13 +40,9 @@ export default function Dashboard() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  };
-
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 5000);
-    return () => clearInterval(interval);
   }, []);
+
+  usePolling(loadData, 5000);
 
   if (loading) {
     return (
@@ -118,8 +119,13 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Card className="border-border bg-card/50">
           <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <span className="text-xl">📊</span> Recent Jobs
+            <CardTitle className="text-lg flex items-center justify-between gap-2">
+              <span className="flex items-center gap-2">
+                <span className="text-xl">📊</span> Recent Jobs
+              </span>
+              <Link to="/jobs" className="text-sm font-normal text-muted-foreground hover:text-primary">
+                View all →
+              </Link>
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -129,8 +135,13 @@ export default function Dashboard() {
 
         <Card className="border-border bg-card/50">
           <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <span className="text-xl">👥</span> Active Workers
+            <CardTitle className="text-lg flex items-center justify-between gap-2">
+              <span className="flex items-center gap-2">
+                <span className="text-xl">👥</span> Active Workers
+              </span>
+              <Link to="/workers" className="text-sm font-normal text-muted-foreground hover:text-primary">
+                View all →
+              </Link>
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -150,37 +161,39 @@ function RecentJobsList({ jobs }: { jobs: Job[] }) {
   return (
     <div className="space-y-3">
       {jobs.slice(0, 5).map(job => (
-        <div key={job.id} className="flex items-center justify-between p-3 rounded-lg bg-background/50 border border-border">
+        <Link
+          key={job.id}
+          to={`/jobs/${job.id}`}
+          className="flex items-center justify-between p-3 rounded-lg bg-background/50 border border-border hover:border-primary/50 transition-colors"
+        >
           <div>
             <p className="font-medium">{job.name}</p>
-            <p className="text-xs text-muted-foreground">
-              {new Date(job.createdAt).toLocaleTimeString()}
-            </p>
+            <p className="text-xs text-muted-foreground">{formatRelative(job.createdAt)}</p>
           </div>
           <Badge status={job.status} />
-        </div>
+        </Link>
       ))}
     </div>
   );
 }
 
 function ActiveWorkersList({ workers }: { workers: Worker[] }) {
-  if (workers.length === 0) {
+  const active = workers.filter(worker => worker.status === 'HEALTHY' || worker.status === 'BUSY');
+
+  if (active.length === 0) {
     return <p className="text-muted-foreground text-center py-4">No workers online</p>;
   }
 
   return (
     <div className="space-y-3">
-      {workers.map(worker => (
+      {active.map(worker => (
         <div key={worker.id} className="flex items-center justify-between p-3 rounded-lg bg-background/50 border border-border">
           <div className="flex items-center gap-3">
             <div className={`w-3 h-3 rounded-full ${
-              worker.status === 'HEALTHY' ? 'bg-emerald-500' :
-              worker.status === 'BUSY' ? 'bg-blue-500' :
-              worker.status === 'STALE' ? 'bg-amber-500' : 'bg-red-500'
+              worker.status === 'HEALTHY' ? 'bg-emerald-500' : 'bg-blue-500'
             } animate-pulse`} />
             <div>
-              <p className="font-medium font-mono text-sm">{worker.id.slice(0, 12)}...</p>
+              <p className="font-medium font-mono text-sm">{shortId(worker.id)}</p>
               <p className="text-xs text-muted-foreground">{worker.activeTasks} active tasks</p>
             </div>
           </div>

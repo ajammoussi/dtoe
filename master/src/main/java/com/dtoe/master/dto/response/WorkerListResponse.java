@@ -1,12 +1,10 @@
 package com.dtoe.master.dto.response;
 
-import com.dtoe.shared.enums.WorkerStatus;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.time.Instant;
 import java.util.List;
 
 @Data
@@ -16,6 +14,8 @@ import java.util.List;
 public class WorkerListResponse {
 
     private List<WorkerResponse> workers;
+    private int activeCount;
+    private int inactiveCount;
     private int totalCapacity;
     private int totalActiveTasks;
     private double clusterUtilizationPct;

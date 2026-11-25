@@ -1,4 +1,15 @@
-import type { Job, Task, Worker, CreateJobRequest } from '../types';
+import {
+  JOB_STATUSES,
+  TASK_STATUSES,
+  WORKER_STATUSES,
+  type Job,
+  type JobStatus,
+  type Task,
+  type TaskStatus,
+  type Worker,
+  type WorkerStatus,
+  type CreateJobRequest,
+} from '../types';
 
 const API_BASE = '/api/v1';
 
@@ -39,6 +50,7 @@ interface PageQuery {
   page?: number;
   size?: number;
   status?: string;
+  q?: string;
 }
 
 interface RawPage {
@@ -47,6 +59,15 @@ interface RawPage {
   totalPages?: unknown;
   number?: unknown;
   size?: unknown;
+}
+
+export interface WorkerListResult {
+  workers: Worker[];
+  activeCount: number;
+  inactiveCount: number;
+  totalCapacity: number;
+  totalActiveTasks: number;
+  clusterUtilizationPct: number;
 }
 
 type RawRecord = Record<string, unknown>;
@@ -75,31 +96,28 @@ function asStringArray(value: unknown): string[] | undefined {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : undefined;
 }
 
-const JOB_STATUSES: readonly Job['status'][] = ['RUNNING', 'SUCCESS', 'FAILED', 'PARTIALLY_FAILED', 'CANCELLED'];
-const TASK_STATUSES: readonly Task['status'][] = [
-  'PENDING', 'QUEUED', 'RUNNING', 'SUCCESS', 'FAILED', 'TIMED_OUT', 'RETRYING', 'CANCELLED',
-];
-const WORKER_STATUSES: readonly Worker['status'][] = ['HEALTHY', 'BUSY', 'STALE', 'DEAD'];
-
-function jobStatus(value: unknown): Job['status'] {
+function jobStatus(value: unknown): JobStatus {
   const status = asString(value);
-  return JOB_STATUSES.includes(status as Job['status']) ? (status as Job['status']) : 'RUNNING';
+  return JOB_STATUSES.includes(status as JobStatus) ? (status as JobStatus) : 'RUNNING';
 }
 
-function taskStatus(value: unknown): Task['status'] {
+function taskStatus(value: unknown): TaskStatus {
   const status = asString(value);
-  return TASK_STATUSES.includes(status as Task['status']) ? (status as Task['status']) : 'PENDING';
+  return TASK_STATUSES.includes(status as TaskStatus) ? (status as TaskStatus) : 'PENDING';
 }
 
-function workerStatus(value: unknown): Worker['status'] {
+function workerStatus(value: unknown): WorkerStatus {
   const status = asString(value);
-  return WORKER_STATUSES.includes(status as Worker['status']) ? (status as Worker['status']) : 'DEAD';
+  return WORKER_STATUSES.includes(status as WorkerStatus) ? (status as WorkerStatus) : 'DEAD';
 }
 
-function pageParams({ page = 0, size = 20, status }: PageQuery): string {
+function pageParams({ page = 0, size = 20, status, q }: PageQuery): string {
   const params = new URLSearchParams({ page: String(page), size: String(size) });
   if (status) {
     params.set('status', status);
+  }
+  if (q) {
+    params.set('q', q);
   }
   return params.toString();
 }
@@ -117,10 +135,6 @@ function mapPage<T>(raw: RawPage, mapper: (item: unknown) => T): PageResult<T> {
 
 export const api = {
   jobs: {
-    list: async () => {
-      const res = await fetchJson<RawPage>('/jobs');
-      return mapPage(res, mapJob).content;
-    },
     listPage: async (query: PageQuery = {}) => {
       const res = await fetchJson<RawPage>(`/jobs?${pageParams(query)}`);
       return mapPage(res, mapJob);
@@ -150,10 +164,17 @@ export const api = {
   },
 
   workers: {
-    list: async () => {
-      const res = await fetchJson<unknown>('/workers');
-      const workers = asRecord(res).workers;
-      return Array.isArray(workers) ? workers.map(mapWorker) : [];
+    list: async (): Promise<WorkerListResult> => {
+      const res = asRecord(await fetchJson<unknown>('/workers'));
+      const workers = res.workers;
+      return {
+        workers: Array.isArray(workers) ? workers.map(mapWorker) : [],
+        activeCount: asNumber(res.activeCount),
+        inactiveCount: asNumber(res.inactiveCount),
+        totalCapacity: asNumber(res.totalCapacity),
+        totalActiveTasks: asNumber(res.totalActiveTasks),
+        clusterUtilizationPct: asNumber(res.clusterUtilizationPct),
+      };
     },
   },
 };
@@ -170,6 +191,7 @@ function mapJob(raw: unknown): Job {
     submittedBy: optionalString(job.submittedBy),
     taskCount: optionalNumber(job.taskCount),
     completedTasks: optionalNumber(job.completedTasks),
+    failedTasks: optionalNumber(job.failedTasks),
     tasks: Array.isArray(tasks) ? tasks.map(mapTask) : undefined,
   };
 }
@@ -179,6 +201,7 @@ function mapTask(raw: unknown): Task {
   return {
     id: asString(task.taskId) || asString(task.id),
     jobId: optionalString(task.jobId),
+    jobName: optionalString(task.jobName),
     name: optionalString(task.name),
     type: asString(task.type),
     status: taskStatus(task.status),
@@ -190,6 +213,9 @@ function mapTask(raw: unknown): Task {
     completedAt: optionalString(task.completedAt),
     workerId: optionalString(task.workerId),
     errorMessage: optionalString(task.errorMessage),
+    payload: task.payload !== null && typeof task.payload === 'object'
+      ? (task.payload as Record<string, unknown>)
+      : undefined,
     output: task.output !== null && typeof task.output === 'object'
       ? (task.output as Record<string, unknown>)
       : undefined,

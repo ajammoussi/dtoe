@@ -41,12 +41,13 @@ public class JobController {
     @GetMapping
     public ResponseEntity<Page<JobSummaryResponse>> listJobs(
             @RequestParam(required = false) JobStatus status,
+            @RequestParam(name = "q", required = false) String q,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size,
             @RequestParam(defaultValue = "createdAt,desc") String sort) {
 
         Pageable pageable = toPageable(page, size, sort);
-        Page<JobSummaryResponse> jobs = jobService.listJobs(status, pageable);
+        Page<JobSummaryResponse> jobs = jobService.listJobs(status, q, pageable);
         return ResponseEntity.ok(jobs);
     }
 

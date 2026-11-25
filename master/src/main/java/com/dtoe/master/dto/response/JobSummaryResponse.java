@@ -20,6 +20,7 @@ public class JobSummaryResponse {
     private JobStatus status;
     private int taskCount;
     private int completedTasks;
+    private int failedTasks;
     private Instant createdAt;
     private Instant completedAt;
 }

@@ -9,6 +9,7 @@ import lombok.NoArgsConstructor;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @Data
@@ -22,6 +23,7 @@ public class JobDetailResponse {
     private JobStatus status;
     private String submittedBy;
     private Instant createdAt;
+    private Instant completedAt;
     private List<TaskSummary> tasks;
 
     @Data
@@ -39,6 +41,8 @@ public class JobDetailResponse {
         private int timeoutSeconds;
         private Instant startedAt;
         private Instant completedAt;
+        private String errorMessage;
+        private Map<String, Object> payload;
         private List<UUID> dependencies;
     }
 }

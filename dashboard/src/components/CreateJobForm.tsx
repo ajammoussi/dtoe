@@ -1,8 +1,10 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api } from '../api/api';
-import type { CreateJobRequest, CreateTaskRequest } from '../types';
+import type { CreateJobRequest, CreateTaskRequest, Task } from '../types';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
+import { TaskGraph } from './graph/TaskGraph';
+import { TaskDetailsPanel } from './graph/TaskDetailsPanel';
 import { jobTemplates } from '../lib/jobTemplates';
 
 interface CreateJobFormProps {
@@ -19,6 +21,35 @@ export default function CreateJobForm({ onSuccess, onCancel }: CreateJobFormProp
   const [showTemplates, setShowTemplates] = useState(false);
 
   const [rawPayloads, setRawPayloads] = useState<Record<number, string>>({});
+  const [previewTaskId, setPreviewTaskId] = useState<string | null>(null);
+
+  const previewTasks = useMemo<Task[]>(() => tasks.map((task, index) => {
+    let payload = task.payload;
+    const raw = rawPayloads[index];
+    if (raw && raw.trim() !== '') {
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          payload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // invalid JSON while typing: keep the last parsed payload
+      }
+    }
+    return {
+      id: task.id,
+      name: task.name,
+      type: task.type,
+      status: 'PENDING',
+      retryCount: 0,
+      maxRetries: task.maxRetries ?? 3,
+      timeoutSeconds: task.timeoutSeconds ?? 60,
+      payload,
+      dependsOn: task.dependsOn ?? [],
+    };
+  }), [tasks, rawPayloads]);
+
+  const selectedPreview = previewTasks.find(task => task.id === previewTaskId) ?? null;
 
   // Ids must never be reused: a shrinking list would otherwise regenerate an id
   // that another task or a dependency still references.
@@ -125,7 +156,7 @@ export default function CreateJobForm({ onSuccess, onCancel }: CreateJobFormProp
   };
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
+    <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_380px] xl:items-start">
       <Card className="border-border bg-card/50">
         <CardHeader>
           <CardTitle className="text-xl">Create New Job</CardTitle>
@@ -327,6 +358,34 @@ export default function CreateJobForm({ onSuccess, onCancel }: CreateJobFormProp
               </Button>
             </div>
           </form>
+        </CardContent>
+      </Card>
+
+      <Card className="border-border bg-card/50 xl:sticky xl:top-24">
+        <CardHeader>
+          <CardTitle className="text-lg">Pipeline preview</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <TaskGraph
+            tasks={previewTasks}
+            selectedId={previewTaskId}
+            currentId={previewTaskId ?? undefined}
+            onSelect={setPreviewTaskId}
+            showStatus={false}
+            height={420}
+            direction="TB"
+            showMinimap={false}
+            emptyLabel="Add tasks to see the dependency graph"
+          />
+          {selectedPreview ? (
+            <TaskDetailsPanel task={selectedPreview} mode="definition" />
+          ) : (
+            previewTasks.length > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Select a node to inspect its command, payload, timeout and retries.
+              </p>
+            )
+          )}
         </CardContent>
       </Card>
     </div>
