@@ -120,6 +120,10 @@ Open http://localhost:3000/jobs, click the job, and inspect the DAG.
 
 The creation form (`Create Job`) renders the same graph live while you edit tasks and payloads.
 
+![DTOE console: job summary and interactive DAG](docs/assets/dtoe-console.gif)
+
+The recording follows a live run: `Fetch raw data` succeeds, the scheduler promotes `Transform records` to RUNNING while the dependency edge animates, and the inspector follows the selection; `Load warehouse` takes the same path.
+
 ---
 
 ## Repository Structure
